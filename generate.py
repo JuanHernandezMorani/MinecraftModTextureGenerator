@@ -74,10 +74,28 @@ EXCLUSIONS = {
     "celestial": [],
 }
 
+OVERLAY_CACHE = {}
+MASK_CACHE = {}
+
+def generate_overlay_if_missing(variant: str, size: Tuple[int,int]):
+    if variant in OVERLAY_CACHE:
+        return OVERLAY_CACHE[variant]
+    # ... lógica de generación
+    OVERLAY_CACHE[variant] = None #overlay
+
+    return None #overlay
 
 class TextureProcessingError(RuntimeError):
     """Raised when the texture processing pipeline encounters an error."""
 
+def detect_anatomical_features(image: Image.Image) -> Dict:
+    # Fallback para cuando la detección automática no sea posible
+    width, height = image.size
+    return {
+        'eyes': [(width//3, height//4, 5), (2*width//3, height//4, 5)],  # Posiciones por defecto
+        'joints': [],
+        'edges': None
+    }
 
 def ensure_directories(variants: Iterable[str]) -> None:
     """Ensure the expected output directory structure exists."""
@@ -296,7 +314,7 @@ def process_texture(image_path: Path) -> None:
         print(f"✓ {image_path.name} → {output_path}")
 
 
-def iter_input_images(directory: Path) -> Iterable[Path:
+def iter_input_images(directory: Path) -> Iterable[Path]:
     """Iterate over PNG images inside ``directory``."""
     if not directory.exists():
         return []
