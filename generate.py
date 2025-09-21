@@ -97,17 +97,6 @@ def load_overlay(variant: str, size: Tuple[int, int]) -> Image.Image | None:
     return overlay
 
 
-def adjust_overlay_opacity(overlay: Image.Image, opacity: float) -> Image.Image:
-    """Return a copy of the overlay with adjusted opacity."""
-    opacity = float(opacity)
-    opacity = max(0.0, min(1.0, opacity))
-    overlay = overlay.copy()
-    alpha = overlay.getchannel("A")
-    lut = [int(round(value * opacity)) for value in range(256)]
-    overlay.putalpha(alpha.point(lut))
-    return overlay
-
-
 def apply_tint(image: Image.Image, config: Dict[str, float]) -> Image.Image:
     """Apply HSV shifts to an RGBA image according to ``config``.
 
@@ -191,6 +180,43 @@ def apply_tint(image: Image.Image, config: Dict[str, float]) -> Image.Image:
     return Image.fromarray(rgba_out, mode="RGBA")
 
 
+def generate_emissive_map(size: Tuple[int, int], variant: str, base_output_path: Path) -> None:
+    """Generate an emissive map for ``variant`` based on the configured mask."""
+
+    mask_path = MASK_DIR / f"{variant}.png"
+    if not mask_path.exists():
+        return
+
+    try:
+        with Image.open(mask_path) as mask_image:
+            mask = mask_image.convert("L")
+    except OSError as exc:
+        print(f"⚠️  No se pudo abrir la máscara emisiva {mask_path}: {exc}")
+        return
+
+    try:
+        if mask.size != size:
+            mask = mask.resize(size, Image.LANCZOS)
+
+        emissive = Image.new("RGBA", size, (0, 0, 0, 255))
+        mask_pixels = mask.load()
+        emissive_pixels = emissive.load()
+        width, height = size
+        for y in range(height):
+            for x in range(width):
+                emissive_pixels[x, y] = (
+                    (255, 255, 255, 255) if mask_pixels[x, y] > 0 else (0, 0, 0, 255)
+                )
+
+        emissive_path = base_output_path.with_name(f"{base_output_path.stem}_e.png")
+        emissive.save(emissive_path)
+        print(f"💡 Mapa emisivo generado: {emissive_path}")
+    except OSError as exc:
+        print(f"⚠️  No se pudo guardar el mapa emisivo para {mask_path}: {exc}")
+    except Exception as exc:
+        print(f"⚠️  Error al generar el mapa emisivo {mask_path}: {exc}")
+
+
 def process_texture(image_path: Path) -> None:
     """Process a single texture across all configured variants."""
     try:
@@ -211,11 +237,11 @@ def process_texture(image_path: Path) -> None:
         tinted = apply_tint(base_image, tint_config)
         overlay = load_overlay(variant, tinted.size)
         if overlay is not None and overlay_opacity > 0:
-            overlay = adjust_overlay_opacity(overlay, overlay_opacity)
-            tinted = Image.alpha_composite(tinted, overlay)
+            tinted = Image.blend(tinted, overlay, overlay_opacity)
 
         output_path = OUTPUT_DIR / variant / f"{base_name}_{variant}.png"
         tinted.save(output_path)
+        generate_emissive_map(tinted.size, variant, output_path)
         print(f"✓ {image_path.name} → {output_path}")
 
 
