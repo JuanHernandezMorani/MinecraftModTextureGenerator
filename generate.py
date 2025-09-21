@@ -86,6 +86,17 @@ def ensure_directories(variants: Iterable[str]) -> None:
         (OUTPUT_DIR / variant).mkdir(parents=True, exist_ok=True)
 
 
+def ensure_rgba(image: Image.Image) -> Image.Image:
+    """Ensure the image is in RGBA mode."""
+    return image.convert("RGBA") if image.mode != "RGBA" else image
+
+
+def get_height_map(image: Image.Image) -> np.ndarray:
+    """Convert image to grayscale and normalize to [0, 1] range."""
+    grayscale = image.convert("L")
+    return np.array(grayscale, dtype=np.float32) / 255.0
+
+
 def load_overlay(variant: str, size: Tuple[int, int]) -> Image.Image | None:
     """Load and resize an overlay for the variant if available."""
     overlay_path = OVERLAY_DIR / f"{variant}.png"
@@ -96,103 +107,6 @@ def load_overlay(variant: str, size: Tuple[int, int]) -> Image.Image | None:
     if overlay.size != size:
         overlay = overlay.resize(size, Image.LANCZOS)
     return overlay
-
-
-def ensure_rgba(image: Image.Image) -> Image.Image:
-    """Return a copy of ``image`` guaranteed to be in RGBA mode."""
-
-    if image.mode == "RGBA":
-        return image
-    return image.convert("RGBA")
-
-
-def get_height_map(image: Image.Image) -> np.ndarray:
-    """Return a normalized height map derived from ``image``."""
-
-    grayscale = ensure_rgba(image).convert("L")
-    return np.array(grayscale, dtype=np.float32) / 255.0
-
-
-def apply_tint(image: Image.Image, config: Dict[str, float]) -> Image.Image:
-    """Apply HSV shifts to an RGBA image according to ``config``.
-
-    ``config`` should contain ``hue_shift``, ``saturation_shift`` and
-    ``value_shift`` expressed as fractional adjustments.
-    """
-
-    image = ensure_rgba(image)
-
-    rgba = np.array(image).astype(np.float32)
-    rgb = rgba[..., :3] / 255.0
-    alpha = rgba[..., 3:4] / 255.0
-
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    maxc = np.max(rgb, axis=-1)
-    minc = np.min(rgb, axis=-1)
-    delta = maxc - minc
-
-    hue = np.zeros_like(maxc)
-    mask = delta != 0
-    r_is_max = (maxc == r) & mask
-    g_is_max = (maxc == g) & mask
-    b_is_max = (maxc == b) & mask
-
-    hue[r_is_max] = ((g - b)[r_is_max] / delta[r_is_max]) % 6
-    hue[g_is_max] = ((b - r)[g_is_max] / delta[g_is_max]) + 2
-    hue[b_is_max] = ((r - g)[b_is_max] / delta[b_is_max]) + 4
-    hue = hue / 6.0  # Normalize to [0, 1)
-
-    saturation = np.zeros_like(maxc)
-    non_zero_max = maxc != 0
-    saturation[non_zero_max] = delta[non_zero_max] / maxc[non_zero_max]
-
-    value = maxc
-
-    hue_shift = float(config.get("hue_shift", 0.0))
-    saturation_shift = float(config.get("saturation_shift", 0.0))
-    value_shift = float(config.get("value_shift", 0.0))
-
-    hue = (hue + hue_shift) % 1.0
-    saturation = np.clip(saturation + saturation_shift, 0.0, 1.0)
-    value = np.clip(value + value_shift, 0.0, 1.0)
-
-    # HSV back to RGB
-    h6 = hue * 6.0
-    i = np.floor(h6).astype(int) % 6
-    f = h6 - np.floor(h6)
-
-    p = value * (1 - saturation)
-    q = value * (1 - saturation * f)
-    t = value * (1 - saturation * (1 - f))
-
-    rgb_out = np.zeros_like(rgb)
-
-    i_eq_0 = i == 0
-    i_eq_1 = i == 1
-    i_eq_2 = i == 2
-    i_eq_3 = i == 3
-    i_eq_4 = i == 4
-    i_eq_5 = i == 5
-
-    rgb_out[..., 0] = np.select(
-        [i_eq_0, i_eq_1, i_eq_2, i_eq_3, i_eq_4, i_eq_5],
-        [value, q, p, p, t, value],
-        default=value,
-    )
-    rgb_out[..., 1] = np.select(
-        [i_eq_0, i_eq_1, i_eq_2, i_eq_3, i_eq_4, i_eq_5],
-        [t, value, value, q, p, p],
-        default=value,
-    )
-    rgb_out[..., 2] = np.select(
-        [i_eq_0, i_eq_1, i_eq_2, i_eq_3, i_eq_4, i_eq_5],
-        [p, p, t, value, value, q],
-        default=value,
-    )
-
-    rgba_out = np.concatenate((rgb_out, alpha), axis=-1)
-    rgba_out = np.clip(rgba_out * 255.0, 0, 255).astype(np.uint8)
-    return Image.fromarray(rgba_out, mode="RGBA")
 
 
 def generate_emissive_map(size: Tuple[int, int], variant: str, base_output_path: Path) -> None:
@@ -272,6 +186,87 @@ def generate_normal_map(image: Image.Image, output_path: Path) -> None:
         print(f"⚠️  Error al generar el mapa normal para {output_path}: {exc}")
 
 
+def apply_tint(image: Image.Image, config: Dict[str, float]) -> Image.Image:
+    """Apply HSV shifts to an RGBA image according to ``config``.
+
+    ``config`` should contain ``hue_shift``, ``saturation_shift`` and
+    ``value_shift`` expressed as fractional adjustments.
+    """
+
+    working_image = ensure_rgba(image)
+    rgba = np.array(working_image).astype(np.float32)
+    rgb = rgba[..., :3] / 255.0
+    alpha = rgba[..., 3:4] / 255.0
+
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    maxc = np.max(rgb, axis=-1)
+    minc = np.min(rgb, axis=-1)
+    delta = maxc - minc
+
+    hue = np.zeros_like(maxc)
+    mask = delta != 0
+    r_is_max = (maxc == r) & mask
+    g_is_max = (maxc == g) & mask
+    b_is_max = (maxc == b) & mask
+
+    hue[r_is_max] = ((g - b)[r_is_max] / delta[r_is_max]) % 6
+    hue[g_is_max] = ((b - r)[g_is_max] / delta[g_is_max]) + 2
+    hue[b_is_max] = ((r - g)[b_is_max] / delta[b_is_max]) + 4
+    hue = hue / 6.0  # Normalize to [0, 1)
+
+    saturation = np.zeros_like(maxc)
+    non_zero_max = maxc != 0
+    saturation[non_zero_max] = delta[non_zero_max] / maxc[non_zero_max]
+
+    value = maxc
+
+    hue_shift = float(config.get("hue_shift", 0.0))
+    saturation_shift = float(config.get("saturation_shift", 0.0))
+    value_shift = float(config.get("value_shift", 0.0))
+
+    hue = (hue + hue_shift) % 1.0
+    saturation = np.clip(saturation + saturation_shift, 0.0, 1.0)
+    value = np.clip(value + value_shift, 0.0, 1.0)
+
+    # HSV back to RGB
+    h6 = hue * 6.0
+    i = np.floor(h6).astype(int) % 6
+    f = h6 - np.floor(h6)
+
+    p = value * (1 - saturation)
+    q = value * (1 - saturation * f)
+    t = value * (1 - saturation * (1 - f))
+
+    rgb_out = np.zeros_like(rgb)
+
+    i_eq_0 = i == 0
+    i_eq_1 = i == 1
+    i_eq_2 = i == 2
+    i_eq_3 = i == 3
+    i_eq_4 = i == 4
+    i_eq_5 = i == 5
+
+    rgb_out[..., 0] = np.select(
+        [i_eq_0, i_eq_1, i_eq_2, i_eq_3, i_eq_4, i_eq_5],
+        [value, q, p, p, t, value],
+        default=value,
+    )
+    rgb_out[..., 1] = np.select(
+        [i_eq_0, i_eq_1, i_eq_2, i_eq_3, i_eq_4, i_eq_5],
+        [t, value, value, q, p, p],
+        default=value,
+    )
+    rgb_out[..., 2] = np.select(
+        [i_eq_0, i_eq_1, i_eq_2, i_eq_3, i_eq_4, i_eq_5],
+        [p, p, t, value, value, q],
+        default=value,
+    )
+
+    rgba_out = np.concatenate((rgb_out, alpha), axis=-1)
+    rgba_out = np.clip(rgba_out * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(rgba_out, mode="RGBA")
+
+
 def process_texture(image_path: Path) -> None:
     """Process a single texture across all configured variants."""
     try:
@@ -301,7 +296,7 @@ def process_texture(image_path: Path) -> None:
         print(f"✓ {image_path.name} → {output_path}")
 
 
-def iter_input_images(directory: Path) -> Iterable[Path]:
+def iter_input_images(directory: Path) -> Iterable[Path:
     """Iterate over PNG images inside ``directory``."""
     if not directory.exists():
         return []
