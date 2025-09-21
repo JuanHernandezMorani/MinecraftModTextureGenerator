@@ -13,6 +13,7 @@ from typing import Dict, Iterable, Tuple
 
 from PIL import Image
 import numpy as np
+from scipy import ndimage
 
 # Directory configuration
 INPUT_DIR = Path("input")
@@ -97,6 +98,21 @@ def load_overlay(variant: str, size: Tuple[int, int]) -> Image.Image | None:
     return overlay
 
 
+def ensure_rgba(image: Image.Image) -> Image.Image:
+    """Return a copy of ``image`` guaranteed to be in RGBA mode."""
+
+    if image.mode == "RGBA":
+        return image
+    return image.convert("RGBA")
+
+
+def get_height_map(image: Image.Image) -> np.ndarray:
+    """Return a normalized height map derived from ``image``."""
+
+    grayscale = ensure_rgba(image).convert("L")
+    return np.array(grayscale, dtype=np.float32) / 255.0
+
+
 def apply_tint(image: Image.Image, config: Dict[str, float]) -> Image.Image:
     """Apply HSV shifts to an RGBA image according to ``config``.
 
@@ -104,8 +120,7 @@ def apply_tint(image: Image.Image, config: Dict[str, float]) -> Image.Image:
     ``value_shift`` expressed as fractional adjustments.
     """
 
-    if image.mode != "RGBA":
-        image = image.convert("RGBA")
+    image = ensure_rgba(image)
 
     rgba = np.array(image).astype(np.float32)
     rgb = rgba[..., :3] / 255.0
@@ -217,6 +232,46 @@ def generate_emissive_map(size: Tuple[int, int], variant: str, base_output_path:
         print(f"⚠️  Error al generar el mapa emisivo {mask_path}: {exc}")
 
 
+def generate_normal_map(image: Image.Image, output_path: Path) -> None:
+    """Generate a normal map based on ``image`` height information."""
+
+    try:
+        working_image = ensure_rgba(image)
+        height_map = get_height_map(working_image)
+
+        gradient_x = ndimage.sobel(height_map, axis=1, mode="reflect")
+        gradient_y = ndimage.sobel(height_map, axis=0, mode="reflect")
+
+        nz = np.ones_like(gradient_x, dtype=np.float32)
+        magnitude = np.sqrt(gradient_x**2 + gradient_y**2 + nz**2)
+        magnitude = np.where(magnitude == 0, 1.0, magnitude)
+
+        normal_x = -gradient_x / magnitude
+        normal_y = -gradient_y / magnitude
+        normal_z = nz / magnitude
+
+        normal_rgb = np.stack(
+            [
+                np.clip((normal_x * 0.5 + 0.5) * 255.0, 0, 255),
+                np.clip((normal_y * 0.5 + 0.5) * 255.0, 0, 255),
+                np.clip((normal_z * 0.5 + 0.5) * 255.0, 0, 255),
+            ],
+            axis=-1,
+        ).astype(np.uint8)
+
+        alpha_channel = np.array(working_image.getchannel("A"))
+        normal_rgb[alpha_channel == 0] = 0
+
+        normal_image = Image.fromarray(normal_rgb, mode="RGB")
+        normal_path = output_path.with_name(f"{output_path.stem}_n.png")
+        normal_image.save(normal_path)
+        print(f"🌐 Mapa normal generado: {normal_path}")
+    except OSError as exc:
+        print(f"⚠️  No se pudo guardar el mapa normal para {output_path}: {exc}")
+    except Exception as exc:
+        print(f"⚠️  Error al generar el mapa normal para {output_path}: {exc}")
+
+
 def process_texture(image_path: Path) -> None:
     """Process a single texture across all configured variants."""
     try:
@@ -241,6 +296,7 @@ def process_texture(image_path: Path) -> None:
 
         output_path = OUTPUT_DIR / variant / f"{base_name}_{variant}.png"
         tinted.save(output_path)
+        generate_normal_map(tinted, output_path)
         generate_emissive_map(tinted.size, variant, output_path)
         print(f"✓ {image_path.name} → {output_path}")
 
