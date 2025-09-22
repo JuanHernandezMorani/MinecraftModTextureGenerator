@@ -1,624 +1,1047 @@
-"""Advanced dataset creation pipeline for Minecraft texture variants."""
+"""High-quality dataset generation pipeline for Minecraft texture variants."""
 
 from __future__ import annotations
 
-import math
-from collections import Counter
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+"""Pipeline avanzado para generar data.csv de alta calidad."""
 
+# DEPENDENCIAS EXACTAS
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageFilter
+from pathlib import Path
+from collections import defaultdict
+import random
+from typing import Dict, List, Tuple, Optional
+import argparse
+from scipy import ndimage
+import math
 from sklearn.model_selection import train_test_split
 
-# Directories to scan recursively for PNG textures.
-TEXTURE_DIRECTORIES: Sequence[Path] = (Path("toLearn"), Path("input"))
-
-# Dataset column definition.
-COLUMNAS_DATASET: List[str] = [
-    "file_name",
-    "x",
-    "y",
-    "width",
-    "height",
-    "label",
-    "r_mean",
-    "g_mean",
-    "b_mean",
-    "r_std",
-    "g_std",
-    "b_std",
-    "brightness_mean",
-    "brightness_std",
-    "gradient_magnitude",
-    "aspect_ratio",
-    "area_ratio",
-    "is_heuristic",
-    "detection_confidence",
-    "split",
-]
-
-# Mapping between suffixes/labels and their dataset-friendly names.
-NUEVAS_ETIQUETAS: Dict[str, str] = {
-    "e": "emissive",
-    "eyes": "eyes",
-    "heart": "heart",
-    "spots": "spots",
-    "crackiness": "cracks",
-    "auto_eyes": "auto_detected_eyes",
-    "auto_glow": "auto_detected_glow",
-    "auto_cracks": "auto_detected_cracks",
-    "base_texture": "base_texture",
-    "unknown": "unknown",
+# CONFIGURACIÓN POR DEFECTO - AJUSTADA PARA MINECRAFT
+CONFIG: Dict[str, Dict[str, Dict[str, float]]] = {
+    'thresholds': {
+        'area_min_pixels': 25,
+        'area_max_ratio': 0.30,
+        'iou_merge': 0.35,
+        'iou_dedup': 0.70,
+        'score_global_min': 0.60,
+        'conf_min': 0.50,
+        'sem_min': 0.40,
+        'vis_min': 0.30,
+        'diff_threshold_ratio': 0.25,
+        'heuristic_threshold_ratio': 0.70,
+    },
+    'limits': {
+        'max_per_class': 1000,
+        'min_per_class': 50,
+        'max_class_share': 0.40,
+        'max_boxes_per_image': 40,
+    },
+    'morphology': {
+        'opening_kernel': (2, 2),
+        'closing_kernel': (3, 3),
+        'dilation_kernel': (2, 2),
+    },
 }
 
-# Ordered suffix definitions for variant textures (longest first to avoid ambiguity).
-VARIANT_SUFFIXES: Sequence[Tuple[str, str]] = (
-    ("_crackiness", "crackiness"),
-    ("_spots", "spots"),
-    ("_heart", "heart"),
-    ("_eyes", "eyes"),
-    ("_e", "e"),
+# Mapeo de etiquetas para variantes emisivas
+VARIANT_LABELS: Dict[str, str] = {
+    'e': 'emissive',
+    'eyes': 'emissive_eyes',
+    'heart': 'emissive_heart',
+    'spots': 'emissive_spots',
+    'crackiness': 'emissive_cracks',
+}
+
+VARIANT_SUFFIXES: Tuple[Tuple[str, str], ...] = (
+    ('_crackiness', 'crackiness'),
+    ('_spots', 'spots'),
+    ('_heart', 'heart'),
+    ('_eyes', 'eyes'),
+    ('_e', 'e'),
 )
 
-
-@dataclass(frozen=True)
-class VariantDetection:
-    """Information about a detected variant region."""
-
-    coords: np.ndarray
-    bbox: Tuple[int, int, int, int]
-    label_key: str
-    detection_confidence: float
-    is_heuristic: bool
+IMAGE_CACHE: Dict[Path, Dict[str, np.ndarray]] = {}
+RNG = random.Random(42)
 
 
-def iter_texture_files() -> List[Path]:
-    """Return all PNG files found recursively inside configured directories."""
+def analyze_filename_pattern(filename: str) -> Dict[str, any]:
+    """Analiza patrones en nombres de archivo para clasificación inteligente."""
 
-    discovered: List[Path] = []
-    seen: set[Path] = set()
-    for base_dir in TEXTURE_DIRECTORIES:
-        if not base_dir.exists():
+    stem = Path(filename).stem.lower()
+
+    BLOCK_ITEMS = {'beam', 'shield', 'sword', 'bricks', 'wood', 'log', 'planks',
+                   'door', 'bed', 'stone', 'ore', 'acacia', 'birch', 'spruce',
+                   'glass', 'wool', 'concrete', 'terracotta', 'sandstone'}
+
+    LARGE_MOBS = {'dragon', 'wither', 'warden', 'giant', 'golem', 'leviathan'}
+    SMALL_MOBS = {'zombie', 'skeleton', 'creeper', 'spider', 'cow', 'pig', 'sheep'}
+
+    is_block_item = any(keyword in stem for keyword in BLOCK_ITEMS)
+    is_large_mob = any(keyword in stem for keyword in LARGE_MOBS)
+    is_small_mob = any(keyword in stem for keyword in SMALL_MOBS)
+
+    variant_suffixes = ['_e', '_eyes', '_heart', '_spots', '_crackiness']
+    is_variant = any(stem.endswith(suffix) for suffix in variant_suffixes)
+    base_name = None
+    suffix_used = None
+
+    if is_variant:
+        for suffix in variant_suffixes:
+            if stem.endswith(suffix):
+                base_name = stem[:-len(suffix)]
+                suffix_used = suffix
+                break
+
+    return {
+        'is_variant': is_variant,
+        'is_block_item': is_block_item,
+        'is_large_mob': is_large_mob,
+        'is_small_mob': is_small_mob,
+        'base_name': base_name,
+        'suffix': suffix_used,
+        'requires_special_rules': is_large_mob or is_block_item,
+    }
+
+
+def apply_alpha_premultiplication(image: Image.Image) -> Image.Image:
+    """Aplica premultiplicación de alpha para mejorar diferencias en transparencias."""
+
+    if image.mode != 'RGBA':
+        image = image.convert('RGBA')
+    arr = np.array(image, dtype=np.float32)
+    alpha = arr[..., 3:4] / 255.0
+    arr[..., :3] *= alpha
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr, mode='RGBA')
+
+
+def advanced_morphological_processing(binary_mask: np.ndarray, config: Dict) -> np.ndarray:
+    """Post-procesamiento morfológico avanzado para casos complejos."""
+
+    try:
+        opened = ndimage.binary_opening(
+            binary_mask,
+            structure=np.ones(config['morphology']['opening_kernel'], dtype=bool),
+        )
+        closed = ndimage.binary_closing(
+            opened,
+            structure=np.ones(config['morphology']['closing_kernel'], dtype=bool),
+        )
+        dilated = ndimage.binary_dilation(
+            closed,
+            structure=np.ones(config['morphology']['dilation_kernel'], dtype=bool),
+        )
+
+        labeled, num_features = ndimage.label(dilated)
+        component_sizes = np.bincount(labeled.ravel())
+        min_size = config['thresholds']['area_min_pixels']
+        cleaned_mask = np.zeros_like(binary_mask, dtype=bool)
+        for i in range(1, num_features + 1):
+            if component_sizes[i] >= min_size:
+                cleaned_mask[labeled == i] = True
+        return cleaned_mask
+    except Exception as exc:  # pragma: no cover - fallback
+        print(f"❌ Error en procesamiento morfológico: {exc}")
+        return binary_mask
+
+
+def find_connected_components_adaptive(binary_mask: np.ndarray, file_info: Dict, config: Dict) -> List[Dict]:
+    """Encuentra componentes conectados aplicando restricciones adaptativas."""
+
+    if not np.any(binary_mask):
+        return []
+
+    labeled, num_features = ndimage.label(binary_mask)
+    slices = ndimage.find_objects(labeled)
+    height, width = binary_mask.shape
+    total_area = float(height * width)
+
+    area_min = config['thresholds']['area_min_pixels']
+    area_max_ratio = config['thresholds']['area_max_ratio']
+
+    if file_info['is_large_mob']:
+        area_max_ratio *= 1.4
+    if file_info['is_block_item']:
+        area_max_ratio *= 0.7
+
+    regions: List[Dict] = []
+    for idx, slc in enumerate(slices, start=1):
+        if slc is None:
             continue
-        for path in base_dir.rglob("*.png"):
-            # Avoid duplicates when directories overlap.
-            if path not in seen:
-                discovered.append(path)
-                seen.add(path)
-    return discovered
+        region_mask = labeled[slc] == idx
+        area = int(region_mask.sum())
+        if area < area_min:
+            continue
+        area_ratio = area / total_area if total_area else 0.0
+        if area_ratio > area_max_ratio:
+            continue
 
-
-def detectar_sufijo(archivo_path: Path) -> Optional[Tuple[str, str]]:
-    """Return the suffix tuple (suffix, label_key) if the file matches a known variant."""
-
-    stem = archivo_path.stem
-    for suffix, label_key in VARIANT_SUFFIXES:
-        if stem.endswith(suffix) and len(stem) > len(suffix):
-            return suffix, label_key
-    return None
-
-
-def obtener_base_para_variante(variant_path: Path) -> Optional[Path]:
-    """Return the base texture path for the provided variant, if it exists."""
-
-    detected = detectar_sufijo(variant_path)
-    if detected is None:
-        return None
-
-    suffix, _ = detected
-    base_stem = variant_path.stem[: -len(suffix)]
-    candidate = variant_path.with_name(f"{base_stem}{variant_path.suffix}")
-    if candidate.exists():
-        return candidate
-
-    # Fallback: search in all known directories by name.
-    base_name = f"{base_stem}{variant_path.suffix}"
-    for directory in TEXTURE_DIRECTORIES:
-        candidate = directory / base_name
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def compute_regions(mask: np.ndarray) -> List[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-    """Compute connected components from a boolean mask."""
-
-    visited = np.zeros_like(mask, dtype=bool)
-    rows, cols = mask.shape
-    neighbours = (
-        (-1, -1),
-        (-1, 0),
-        (-1, 1),
-        (0, -1),
-        (0, 1),
-        (1, -1),
-        (1, 0),
-        (1, 1),
-    )
-
-    regions: List[Tuple[np.ndarray, Tuple[int, int, int, int]]] = []
-
-    for r in range(rows):
-        for c in range(cols):
-            if not mask[r, c] or visited[r, c]:
-                continue
-
-            stack = [(r, c)]
-            coords_list: List[Tuple[int, int]] = []
-            min_r = max_r = r
-            min_c = max_c = c
-
-            while stack:
-                cr, cc = stack.pop()
-                if visited[cr, cc] or not mask[cr, cc]:
-                    continue
-                visited[cr, cc] = True
-                coords_list.append((cr, cc))
-                min_r = min(min_r, cr)
-                max_r = max(max_r, cr)
-                min_c = min(min_c, cc)
-                max_c = max(max_c, cc)
-
-                for dr, dc in neighbours:
-                    nr, nc = cr + dr, cc + dc
-                    if 0 <= nr < rows and 0 <= nc < cols and not visited[nr, nc] and mask[nr, nc]:
-                        stack.append((nr, nc))
-
-            if not coords_list:
-                continue
-
-            coords_array = np.array(coords_list, dtype=int)
-            bbox = (min_c, min_r, max_c - min_c + 1, max_r - min_r + 1)
-            regions.append((coords_array, bbox))
+        y0, y1 = slc[0].start, slc[0].stop
+        x0, x1 = slc[1].start, slc[1].stop
+        region_dict = {
+            'x': int(x0),
+            'y': int(y0),
+            'width': int(x1 - x0),
+            'height': int(y1 - y0),
+            'area': area,
+            'area_ratio': area_ratio,
+            'mask': region_mask.astype(bool),
+            'slice': slc,
+        }
+        regions.append(region_dict)
 
     return regions
 
 
-def encontrar_componentes_conectados(
-    mask: np.ndarray, *, area_minima: int, area_maxima: float
-) -> List[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-    """Find connected components filtered by area constraints."""
+def _region_iou(a: Dict, b: Dict) -> float:
+    ax1, ay1 = a['x'], a['y']
+    ax2, ay2 = ax1 + a['width'], ay1 + a['height']
+    bx1, by1 = b['x'], b['y']
+    bx2, by2 = bx1 + b['width'], by1 + b['height']
 
-    regiones = compute_regions(mask)
-    filtradas: List[Tuple[np.ndarray, Tuple[int, int, int, int]]] = []
-    for coords, bbox in regiones:
-        area = coords.shape[0]
-        if area < area_minima:
-            continue
-        if area > area_maxima:
-            continue
-        filtradas.append((coords, bbox))
-    return filtradas
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = a['width'] * a['height']
+    area_b = b['width'] * b['height']
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+    return inter_area / union
 
 
-def clasificar_region_heuristica(
-    region: Tuple[int, int, int, int], gray_image: np.ndarray, color_image: Image.Image
-) -> Tuple[str, float]:
-    """Clasifica una región detectada usando reglas heurísticas."""
+def merge_regions_intelligent(regions: List[Dict], diff_array: np.ndarray, file_info: Dict, config: Dict) -> List[Dict]:
+    """Fusiones inteligentes de regiones con alta superposición."""
 
-    x, y, w, h = region
-    subregion = gray_image[y : y + h, x : x + w]
+    if not regions:
+        return []
 
-    brillo_promedio = float(subregion.mean()) if subregion.size else 0.0
-    contraste = float(subregion.std()) if subregion.size else 0.0
-    relacion_aspecto = float(w / h) if h else 1.0
-    area = float(w * h)
-    posicion_relativa_y = float(y / gray_image.shape[0]) if gray_image.shape[0] else 0.0
+    for region in regions:
+        y0, x0 = region['y'], region['x']
+        h, w = region['height'], region['width']
+        patch = diff_array[y0:y0 + h, x0:x0 + w]
+        mask = region.get('mask')
+        if mask is not None and mask.shape == patch.shape:
+            values = patch[mask]
+        else:
+            values = patch.reshape(-1)
+        region['raw_score'] = float(np.mean(values)) / 255.0 if values.size else 0.0
+
+    merged: List[Dict] = []
+    for region in sorted(regions, key=lambda r: r['raw_score'], reverse=True):
+        merged_into_existing = False
+        for existing in merged:
+            if _region_iou(region, existing) >= config['thresholds']['iou_merge']:
+                x1 = min(existing['x'], region['x'])
+                y1 = min(existing['y'], region['y'])
+                x2 = max(existing['x'] + existing['width'], region['x'] + region['width'])
+                y2 = max(existing['y'] + existing['height'], region['y'] + region['height'])
+                existing.update({
+                    'x': x1,
+                    'y': y1,
+                    'width': x2 - x1,
+                    'height': y2 - y1,
+                    'area': existing['width'] * existing['height'],
+                })
+                existing['raw_score'] = max(existing['raw_score'], region['raw_score'])
+                merged_into_existing = True
+                break
+        if not merged_into_existing:
+            merged.append(dict(region))
+
+    deduped: List[Dict] = []
+    for region in sorted(merged, key=lambda r: r['raw_score'], reverse=True):
+        if all(_region_iou(region, other) <= config['thresholds']['iou_dedup'] for other in deduped):
+            deduped.append(region)
+
+    return deduped
+
+
+def apply_region_limits(regions: List[Dict], diff_array: np.ndarray, file_info: Dict, config: Dict) -> List[Dict]:
+    """Aplica límites de número de regiones por imagen con prioridad de score."""
+
+    if not regions:
+        return []
+
+    for region in regions:
+        y0, x0 = region['y'], region['x']
+        h, w = region['height'], region['width']
+        patch = diff_array[y0:y0 + h, x0:x0 + w]
+        values = patch.reshape(-1)
+        region['detection_confidence'] = float(np.clip(values.mean() / 255.0 if values.size else 0.0, 0.0, 1.0))
+        suffix = file_info.get('suffix') or ''
+        region['label'] = VARIANT_LABELS.get(suffix.strip('_') or 'e', 'emissive')
+        region['is_heuristic'] = False
+        region['source'] = 'difference'
+        region.pop('mask', None)
+        region.pop('slice', None)
+
+    limit = config['limits']['max_boxes_per_image']
+    if not file_info['is_large_mob']:
+        limit = min(limit, 12 if file_info['is_block_item'] else 20)
+
+    regions_sorted = sorted(regions, key=lambda r: r['detection_confidence'], reverse=True)
+    return regions_sorted[:limit]
+
+
+def process_variant_pair(base_path: Path, variant_path: Path, file_info: Dict, config: Dict) -> List[Dict]:
+    """Pipeline 1: Procesamiento robusto para pares base-variante."""
+
+    try:
+        with Image.open(base_path) as base_raw, Image.open(variant_path) as variant_raw:
+            base_img = base_raw.convert('RGBA')
+            variant_img = variant_raw.convert('RGBA')
+    except Exception as exc:
+        print(f"❌ Error abriendo imágenes {variant_path.name}: {exc}")
+        return []
+
+    if base_img.size != variant_img.size:
+        print(f"⚠️  Tamaños diferentes: {base_path.name} vs {variant_path.name}")
+        return []
+
+    base_premultiplied = apply_alpha_premultiplication(base_img)
+    variant_premultiplied = apply_alpha_premultiplication(variant_img)
+
+    diff_image = ImageChops.difference(base_premultiplied, variant_premultiplied)
+    diff = np.array(diff_image.convert('L'), dtype=np.float32)
+    max_diff = np.max(diff) if np.max(diff) > 0 else 1.0
+    threshold = max(16, int(config['thresholds']['diff_threshold_ratio'] * max_diff))
+    binary_mask = diff > threshold
+
+    cleaned_mask = advanced_morphological_processing(binary_mask, config)
+    regions = find_connected_components_adaptive(cleaned_mask, file_info, config)
+    merged_regions = merge_regions_intelligent(regions, diff, file_info, config)
+    final_regions = apply_region_limits(merged_regions, diff, file_info, config)
+
+    print(f"🔍 {variant_path.name}: {len(regions)} → {len(merged_regions)} → {len(final_regions)} regiones")
+    return final_regions
+
+
+def heuristic_region_detection(image_path: Path, file_info: Dict, config: Dict) -> List[Dict]:
+    """Pipeline 2: Heurística adaptativa basada en tipo de textura."""
+
+    try:
+        with Image.open(image_path) as pil_img:
+            img = pil_img.convert('RGB')
+            img = img.filter(ImageFilter.MedianFilter(size=3))
+    except Exception as exc:
+        print(f"❌ Error abriendo {image_path.name}: {exc}")
+        return []
+
+    img_array = np.array(img)
+    gray = np.array(img.convert('L'), dtype=np.float32)
+
+    max_val = np.max(gray) if np.max(gray) > 0 else 255
+    threshold_ratio = config['thresholds']['heuristic_threshold_ratio']
+    if file_info['is_block_item']:
+        threshold_ratio *= 0.8
+    elif file_info['is_large_mob']:
+        threshold_ratio *= 1.2
+
+    threshold = int(threshold_ratio * max_val)
+    binary_mask = gray > threshold
+
+    cleaned_mask = advanced_morphological_processing(binary_mask, config)
+    regions = find_connected_components_adaptive(cleaned_mask, file_info, config)
+
+    classified_regions: List[Dict] = []
+    for region in regions:
+        classified = classify_region_with_context(region.copy(), gray, img_array, file_info)
+        if classified and classified['detection_confidence'] >= 0.4:
+            classified_regions.append(classified)
+
+    if file_info['is_block_item']:
+        classified_regions = [r for r in classified_regions if r['label'] != 'auto_eyes']
+        if len(classified_regions) > 3:
+            classified_regions = sorted(classified_regions, key=lambda x: x['detection_confidence'], reverse=True)[:3]
+    elif file_info['is_large_mob']:
+        if len(classified_regions) > config['limits']['max_boxes_per_image']:
+            classified_regions = sorted(
+                classified_regions,
+                key=lambda x: x['detection_confidence'],
+                reverse=True,
+            )[:config['limits']['max_boxes_per_image']]
+
+    if not classified_regions:
+        base_region = create_base_region_with_context(img.size, file_info)
+        classified_regions.append(base_region)
+
+    avg_confidence = np.mean([r['detection_confidence'] for r in classified_regions]) if classified_regions else 0
+    print(f"🔍 [AUTO] {image_path.name}: {len(classified_regions)} regiones (conf: {avg_confidence:.2f})")
+    return classified_regions
+
+
+def classify_region_with_context(region: Dict, gray_image: np.ndarray, color_image: np.ndarray, file_info: Dict) -> Optional[Dict]:
+    """Clasificación que considera el contexto específico de Minecraft."""
+
+    x, y, w, h = region['x'], region['y'], region['width'], region['height']
+    img_h, img_w = gray_image.shape
+    if w <= 0 or h <= 0:
+        return None
+
+    subregion = gray_image[y:y + h, x:x + w] if y + h <= img_h and x + w <= img_w else np.array([])
+    if subregion.size == 0:
+        return None
+
+    area = w * h
+    aspect_ratio = w / h if h > 0 else 1.0
+    y_relative = y / img_h if img_h > 0 else 0
+    brightness_mean = float(np.mean(subregion))
+    brightness_std = float(np.std(subregion))
+
+    large_mob_bonus = 1.2 if file_info['is_large_mob'] else 1.0
+    block_item_penalty = 0.6 if file_info['is_block_item'] else 1.0
+    top_position_bonus = 1.5 if y_relative < 0.4 else 1.0
+
+    label = 'unknown'
+    confidence = 0.3
 
     if (
-        area <= 100
-        and brillo_promedio > 200
-        and posicion_relativa_y < 0.4
-        and 0.5 <= relacion_aspecto <= 2.0
+        area <= 100 * large_mob_bonus and
+        brightness_mean > 200 * block_item_penalty and
+        y_relative < 0.4 and
+        0.5 <= aspect_ratio <= 2.0 and
+        not file_info['is_block_item']
     ):
-        return "auto_eyes", 0.85
-    if brillo_promedio > 180 and contraste > 30 and area <= 500:
-        return "auto_glow", 0.8
-    if contraste > 50 and relacion_aspecto > 3.0 and area <= 300:
-        return "auto_cracks", 0.75
-    if area > 1000:
-        return "base_texture", 0.65
-    return "unknown", 0.55
+        label = 'auto_eyes'
+        base_confidence = 0.8 * min(1.0, (brightness_mean - 200) / 55 if brightness_mean > 200 else 0.0)
+        confidence = base_confidence * top_position_bonus * large_mob_bonus * block_item_penalty
+    elif (
+        brightness_mean > 180 and
+        brightness_std > 30 and
+        area <= 500 * large_mob_bonus and
+        aspect_ratio <= 5.0
+    ):
+        label = 'auto_glow'
+        confidence = 0.7 * large_mob_bonus * block_item_penalty
+    elif (
+        brightness_std > 50 and
+        aspect_ratio > 3.0 and
+        area <= 300 and
+        not file_info['is_block_item']
+    ):
+        label = 'auto_cracks'
+        confidence = 0.6
+
+    min_confidence = 0.3 * block_item_penalty
+    if confidence < min_confidence:
+        return None
+
+    region.update({
+        'label': label,
+        'detection_confidence': float(min(0.95, confidence)),
+        'source': 'heuristic',
+        'is_heuristic': True,
+        'context_factors': {
+            'large_mob_bonus': large_mob_bonus,
+            'block_item_penalty': block_item_penalty,
+            'top_position_bonus': top_position_bonus,
+        },
+    })
+    region.pop('mask', None)
+    region.pop('slice', None)
+    return region
 
 
-def build_dataset_record(
-    *,
-    file_name: str,
-    bbox: Tuple[int, int, int, int],
-    coords: np.ndarray,
-    label_key: str,
-    detection_confidence: float,
-    is_heuristic: bool,
-    color_array: np.ndarray,
-    brightness_array: np.ndarray,
-    gradient_magnitude: np.ndarray,
-    total_area: float,
-) -> Dict[str, object]:
-    """Build a dataset record from region coordinates and image statistics."""
+def create_base_region_with_context(image_size: Tuple[int, int], file_info: Dict) -> Dict:
+    """Crea una región base cuando no se detectan regiones válidas."""
 
-    if coords.size == 0:
-        raise ValueError("Empty region coordinates are not allowed")
-
-    rows = coords[:, 0]
-    cols = coords[:, 1]
-
-    r_values = color_array[rows, cols, 0].astype(float)
-    g_values = color_array[rows, cols, 1].astype(float)
-    b_values = color_array[rows, cols, 2].astype(float)
-
-    brightness_values = brightness_array[rows, cols]
-    gradient_values = gradient_magnitude[rows, cols]
-
-    x, y, width, height = bbox
-    area = float(coords.shape[0])
-    area_ratio = float(area / total_area) if total_area else 0.0
-    aspect_ratio = float(width / height) if height else 0.0
-
-    label = NUEVAS_ETIQUETAS.get(label_key, label_key)
-
+    width, height = image_size
+    detection_conf = 0.55 if file_info['is_block_item'] else 0.62
     return {
-        "file_name": file_name,
-        "x": float(x),
-        "y": float(y),
-        "width": float(width),
-        "height": float(height),
-        "label": label,
-        "r_mean": float(r_values.mean()),
-        "g_mean": float(g_values.mean()),
-        "b_mean": float(b_values.mean()),
-        "r_std": float(r_values.std(ddof=0)),
-        "g_std": float(g_values.std(ddof=0)),
-        "b_std": float(b_values.std(ddof=0)),
-        "brightness_mean": float(brightness_values.mean()),
-        "brightness_std": float(brightness_values.std(ddof=0)),
-        "gradient_magnitude": float(gradient_values.mean()),
-        "aspect_ratio": aspect_ratio,
-        "area_ratio": area_ratio,
-        "is_heuristic": bool(is_heuristic),
-        "detection_confidence": float(np.clip(detection_confidence, 0.0, 1.0)),
-        "split": "unassigned",
+        'x': 0,
+        'y': 0,
+        'width': width,
+        'height': height,
+        'area': width * height,
+        'area_ratio': 1.0,
+        'label': 'base_texture',
+        'detection_confidence': detection_conf,
+        'is_heuristic': True,
+        'source': 'fallback',
     }
 
 
-def procesar_con_diferencia(variant_path: Path) -> List[Dict[str, object]]:
-    """Process variant textures by computing the difference with their base texture."""
+def _load_image_arrays(image_path: Path) -> Dict[str, np.ndarray]:
+    if image_path in IMAGE_CACHE:
+        return IMAGE_CACHE[image_path]
 
-    base_path = obtener_base_para_variante(variant_path)
-    detected = detectar_sufijo(variant_path)
-    if detected is None:
-        return []
-    _, label_key = detected
-
-    if base_path is None or not base_path.exists():
-        # No base available: fallback handled by caller.
-        return []
-
-    with Image.open(base_path) as base_img_raw, Image.open(variant_path) as variant_img_raw:
-        base_img = base_img_raw.convert("RGBA")
-        variant_img = variant_img_raw.convert("RGBA")
-
-        if base_img.size != variant_img.size:
-            return []
-
-        diff = ImageChops.difference(base_img, variant_img)
-        diff_gray = diff.convert("L")
-        diff_array = np.array(diff_gray, dtype=np.uint8)
-
-        max_diff = int(diff_array.max())
-        if max_diff == 0:
-            print(f"🔍 Analizando {variant_path.name}: 0 regiones detectadas")
-            return []
-
-        threshold = max_diff * 0.3
-        mask = diff_array > threshold
-
-        if not mask.any():
-            print(f"🔍 Analizando {variant_path.name}: 0 regiones detectadas")
-            return []
-
-        regions = compute_regions(mask)
-        print(f"🔍 Analizando {variant_path.name}: {len(regions)} regiones detectadas")
-
-        variant_rgb = variant_img.convert("RGB")
-        color_array = np.array(variant_rgb, dtype=np.uint8)
-        gray_array = np.array(variant_rgb.convert("L"), dtype=float)
-        gy, gx = np.gradient(gray_array)
-        gradient_magnitude = np.sqrt(gx**2 + gy**2)
-        brightness_array = 0.299 * color_array[:, :, 0] + 0.587 * color_array[:, :, 1] + 0.114 * color_array[:, :, 2]
-
-        total_area = float(variant_img.size[0] * variant_img.size[1])
-
-        records: List[Dict[str, object]] = []
-        for coords, bbox in regions:
-            if coords.size == 0:
-                continue
-            rows = coords[:, 0]
-            cols = coords[:, 1]
-            diff_values = diff_array[rows, cols].astype(float) / 255.0
-            detection_confidence = float(np.clip(diff_values.mean(), 0.0, 1.0))
-
-            record = build_dataset_record(
-                file_name=variant_path.name,
-                bbox=bbox,
-                coords=coords,
-                label_key=label_key,
-                detection_confidence=detection_confidence,
-                is_heuristic=False,
-                color_array=color_array,
-                brightness_array=brightness_array,
-                gradient_magnitude=gradient_magnitude,
-                total_area=total_area,
-            )
-            records.append(record)
-
-        return records
+    with Image.open(image_path) as img:
+        rgb = img.convert('RGB')
+        rgb_array = np.array(rgb, dtype=np.float32)
+        gray_array = np.array(rgb.convert('L'), dtype=np.float32)
+        sobel_x = ndimage.sobel(gray_array, axis=1)
+        sobel_y = ndimage.sobel(gray_array, axis=0)
+        gradient = np.hypot(sobel_x, sobel_y)
+        IMAGE_CACHE[image_path] = {
+            'rgb': rgb_array,
+            'gray': gray_array,
+            'gradient': gradient,
+        }
+        return IMAGE_CACHE[image_path]
 
 
-def procesar_archivo_base(imagen_path: Path) -> List[Dict[str, object]]:
-    """Procesa archivos base sin sufijos emisivos usando detección heurística."""
+def extract_region_features(region: Dict, image_path: Path) -> Dict[str, float]:
+    """Extrae características estadísticas de la región."""
 
-    with Image.open(imagen_path) as img_raw:
-        color_image = img_raw.convert("RGB")
-        gray_image = np.array(color_image.convert("L"))
+    arrays = _load_image_arrays(image_path)
+    rgb = arrays['rgb']
+    gray = arrays['gray']
+    gradient = arrays['gradient']
 
-    img_array = np.array(color_image, dtype=np.uint8)
-    gray_float = gray_image.astype(float)
-    gy, gx = np.gradient(gray_float)
-    gradient_magnitude = np.sqrt(gx**2 + gy**2)
-    brightness_array = 0.299 * img_array[:, :, 0] + 0.587 * img_array[:, :, 1] + 0.114 * img_array[:, :, 2]
+    x, y, w, h = region['x'], region['y'], region['width'], region['height']
+    h = max(1, h)
+    w = max(1, w)
+    h_limit = min(y + h, rgb.shape[0])
+    w_limit = min(x + w, rgb.shape[1])
 
-    max_val = float(gray_image.max())
-    threshold = int(0.7 * max_val) if max_val > 0 else 128
-    mask = gray_image > threshold
+    patch_rgb = rgb[y:h_limit, x:w_limit]
+    patch_gray = gray[y:h_limit, x:w_limit]
+    patch_gradient = gradient[y:h_limit, x:w_limit]
 
-    total_area = float(gray_image.size)
+    r_mean = float(patch_rgb[..., 0].mean()) if patch_rgb.size else 0.0
+    g_mean = float(patch_rgb[..., 1].mean()) if patch_rgb.size else 0.0
+    b_mean = float(patch_rgb[..., 2].mean()) if patch_rgb.size else 0.0
+    r_std = float(patch_rgb[..., 0].std()) if patch_rgb.size else 0.0
+    g_std = float(patch_rgb[..., 1].std()) if patch_rgb.size else 0.0
+    b_std = float(patch_rgb[..., 2].std()) if patch_rgb.size else 0.0
 
-    regiones = encontrar_componentes_conectados(
-        mask, area_minima=5, area_maxima=max(1.0, 0.5 * total_area)
+    brightness_mean = float(patch_gray.mean()) if patch_gray.size else 0.0
+    brightness_std = float(patch_gray.std()) if patch_gray.size else 0.0
+    gradient_mean = float(patch_gradient.mean()) if patch_gradient.size else 0.0
+
+    image_area = float(rgb.shape[0] * rgb.shape[1]) if rgb.size else 1.0
+    area = float(region['width'] * region['height'])
+    area_ratio = min(1.0, area / image_area) if image_area else 0.0
+    aspect_ratio = float(region['width'] / region['height']) if region['height'] else 0.0
+
+    return {
+        'r_mean': r_mean,
+        'g_mean': g_mean,
+        'b_mean': b_mean,
+        'r_std': r_std,
+        'g_std': g_std,
+        'b_std': b_std,
+        'brightness_mean': brightness_mean,
+        'brightness_std': brightness_std,
+        'gradient_magnitude': gradient_mean,
+        'area': area,
+        'area_ratio': area_ratio,
+        'aspect_ratio': aspect_ratio,
+        'image_area': image_area,
+    }
+
+
+def calculate_geometric_quality(region: Dict, file_info: Dict) -> float:
+    area_ratio = region.get('area_ratio', 0.0)
+    aspect_ratio = region.get('aspect_ratio', 1.0)
+
+    min_ratio = CONFIG['thresholds']['area_min_pixels'] / max(region.get('image_area', 1.0), 1.0)
+    max_ratio = CONFIG['thresholds']['area_max_ratio']
+    if file_info['is_large_mob']:
+        max_ratio *= 1.4
+    if file_info['is_block_item']:
+        max_ratio *= 0.8
+
+    ratio_score = np.clip((area_ratio - min_ratio) / max(max_ratio - min_ratio, 1e-6), 0.0, 1.0)
+    aspect_penalty = np.clip(1.0 - abs(math.log(max(aspect_ratio, 1e-3))), 0.0, 1.0)
+    return float(0.7 * ratio_score + 0.3 * aspect_penalty)
+
+
+def calculate_visual_quality_robust(region: Dict) -> float:
+    brightness_std = region.get('brightness_std', 0.0)
+    gradient = region.get('gradient_magnitude', 0.0)
+    contrast_score = np.clip(brightness_std / 60.0, 0.0, 1.0)
+    gradient_score = np.clip(gradient / 40.0, 0.0, 1.0)
+    return float(0.6 * contrast_score + 0.4 * gradient_score)
+
+
+def evaluate_semantic_coherence_adaptive(region: Dict, file_info: Dict) -> float:
+    label = region.get('label', 'unknown')
+    base_score = 0.4
+    if label == 'auto_eyes' and not file_info['is_block_item']:
+        base_score = 0.75
+    elif label == 'auto_glow':
+        base_score = 0.65
+    elif label == 'auto_cracks':
+        base_score = 0.55
+    elif label.startswith('emissive'):
+        base_score = 0.8
+    elif label == 'base_texture':
+        base_score = 0.6
+
+    if file_info['is_large_mob'] and label in {'auto_eyes', 'auto_glow'}:
+        base_score += 0.1
+    if file_info['is_block_item'] and label == 'base_texture':
+        base_score += 0.05
+    return float(np.clip(base_score, 0.0, 1.0))
+
+
+def predict_training_utility(region: Dict, file_info: Dict) -> float:
+    conf = region.get('detection_confidence', 0.5)
+    area_ratio = region.get('area_ratio', 0.0)
+    utility = 0.6 * conf + 0.4 * np.clip(area_ratio / CONFIG['thresholds']['area_max_ratio'], 0.0, 1.0)
+    if region.get('label') == 'base_texture' and file_info['is_block_item']:
+        utility *= 0.9
+    return float(np.clip(utility, 0.0, 1.0))
+
+
+def comprehensive_quality_assessment(region: Dict, image_path: Path, file_info: Dict) -> Dict[str, float]:
+    try:
+        image_arrays = _load_image_arrays(image_path)
+        geom_quality = calculate_geometric_quality(region, file_info)
+        visual_quality = calculate_visual_quality_robust(region)
+        semantic_quality = evaluate_semantic_coherence_adaptive(region, file_info)
+        utility_score = predict_training_utility(region, file_info)
+
+        weights = {
+            'geometric': 0.20,
+            'visual': 0.25,
+            'semantic': 0.30,
+            'utility': 0.15,
+            'confidence': 0.10,
+        }
+        if file_info['is_large_mob']:
+            weights['semantic'] = 0.35
+            weights['visual'] = 0.20
+
+        global_score = (
+            weights['geometric'] * geom_quality
+            + weights['visual'] * visual_quality
+            + weights['semantic'] * semantic_quality
+            + weights['utility'] * utility_score
+            + weights['confidence'] * region.get('detection_confidence', 0.5)
+        )
+        return {
+            'geometric_quality': geom_quality,
+            'visual_quality': visual_quality,
+            'semantic_coherence': semantic_quality,
+            'training_utility': utility_score,
+            'score_global': float(min(1.0, global_score)),
+        }
+    except Exception as exc:
+        print(f"⚠️  Error en evaluación de calidad para {image_path.name}: {exc}")
+        return {
+            'geometric_quality': 0.3,
+            'visual_quality': 0.3,
+            'semantic_coherence': 0.3,
+            'training_utility': 0.3,
+            'score_global': 0.3,
+        }
+
+
+def apply_geometric_filters(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
+    if df.empty:
+        return df
+    area_min = config['thresholds']['area_min_pixels']
+    area_max_ratio = config['thresholds']['area_max_ratio']
+    mask_valid = (
+        (df['width'] > 0)
+        & (df['height'] > 0)
+        & (df['area'] >= area_min)
+        & ((df['area_ratio'] <= area_max_ratio * 1.2) | (df['label'] == 'base_texture'))
     )
+    return df[mask_valid].reset_index(drop=True)
 
-    resultados: List[Dict[str, object]] = []
-    detecciones: List[VariantDetection] = []
 
-    for coords, bbox in regiones:
-        etiqueta, confianza = clasificar_region_heuristica(bbox, gray_image, color_image)
-        detecciones.append(
-            VariantDetection(
-                coords=coords,
-                bbox=bbox,
-                label_key=etiqueta,
-                detection_confidence=confianza,
-                is_heuristic=True,
-            )
+def apply_quality_filters(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
+    if df.empty:
+        return df
+    thresholds = config['thresholds']
+    mask = (
+        (df['detection_confidence'] >= thresholds['conf_min'])
+        & (df['semantic_coherence'] >= thresholds['sem_min'])
+        & (df['visual_quality'] >= thresholds['vis_min'])
+        & (df['score_global'] >= thresholds['score_global_min'])
+    )
+    return df[mask].reset_index(drop=True)
+
+
+def deduplicate_regions(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    df_sorted = df.sort_values('score_global', ascending=False).reset_index(drop=True)
+    keep_indices: List[int] = []
+    for idx, row in df_sorted.iterrows():
+        bbox_row = {
+            'x': row['x'],
+            'y': row['y'],
+            'width': row['width'],
+            'height': row['height'],
+        }
+        if all(
+            _region_iou(
+                bbox_row,
+                {
+                    'x': df_sorted.loc[keep_idx, 'x'],
+                    'y': df_sorted.loc[keep_idx, 'y'],
+                    'width': df_sorted.loc[keep_idx, 'width'],
+                    'height': df_sorted.loc[keep_idx, 'height'],
+                },
+            ) <= config['thresholds']['iou_dedup']
+            for keep_idx in keep_indices
+        ):
+            keep_indices.append(idx)
+    return df_sorted.loc[keep_indices].reset_index(drop=True)
+
+
+def intelligent_balancing(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    limits = config['limits']
+    grouped = []
+    for label, data in df.groupby('label'):
+        data_sorted = data.sort_values('score_global', ascending=False)
+        original_count = len(data_sorted)
+        if len(data_sorted) > limits['max_per_class']:
+            data_sorted = data_sorted.head(limits['max_per_class'])
+            print(f"📉 Submuestreando {label}: {original_count} → {len(data_sorted)}")
+        if 0 < len(data_sorted) < limits['min_per_class']:
+            repeat = int(math.ceil(limits['min_per_class'] / len(data_sorted)))
+            oversampled = pd.concat([data_sorted] * repeat, ignore_index=True).head(limits['min_per_class'])
+            data_sorted = oversampled
+            print(f"📈 Sobremuestreando {label}: {original_count} → {len(data_sorted)}")
+        grouped.append(data_sorted)
+
+    balanced = pd.concat(grouped, ignore_index=True)
+    total = len(balanced)
+    final_groups = []
+    for label, data in balanced.groupby('label'):
+        max_share = int(limits['max_class_share'] * total)
+        if max_share and len(data) > max_share:
+            final_groups.append(data.head(max_share))
+        else:
+            final_groups.append(data)
+    if final_groups:
+        balanced = pd.concat(final_groups, ignore_index=True)
+    return balanced.sort_values('score_global', ascending=False).reset_index(drop=True)
+
+
+def enhanced_quality_validation(df: pd.DataFrame, config: Dict) -> Dict[str, any]:
+    if len(df) == 0:
+        return {
+            'total_records': 0,
+            'classes_detected': 0,
+            'average_global_score': 0,
+            'quality_distribution': {},
+            'meets_standards': False,
+            'alerts': ['Dataset vacío'],
+            'recommendations': ['Revisar configuración de umbrales'],
+        }
+
+    quality_counts = defaultdict(int)
+    quality_counts['excellent'] = len(df[df['score_global'] >= 0.8])
+    quality_counts['good'] = len(df[(df['score_global'] >= 0.6) & (df['score_global'] < 0.8)])
+    quality_counts['poor'] = len(df[df['score_global'] < 0.6])
+
+    metrics = {
+        'total_records': len(df),
+        'classes_detected': df['label'].nunique(),
+        'average_global_score': df['score_global'].mean(),
+        'quality_distribution': dict(quality_counts),
+        'meets_standards': True,
+        'alerts': [],
+        'recommendations': [],
+    }
+
+    quality_thresholds = {
+        'min_total_records': 100,
+        'min_global_score': config['thresholds']['score_global_min'],
+        'min_class_examples': config['limits']['min_per_class'],
+        'max_class_share': config['limits']['max_class_share'],
+        'min_quality_ratio': 0.7,
+    }
+
+    if metrics['total_records'] < quality_thresholds['min_total_records']:
+        metrics['alerts'].append(
+            f"Dataset muy pequeño ({metrics['total_records']} < {quality_thresholds['min_total_records']})"
         )
+        metrics['meets_standards'] = False
 
-    if detecciones:
-        confianzas = [d.detection_confidence for d in detecciones]
-        confianza_promedio = float(np.mean(confianzas)) if confianzas else 0.0
+    if metrics['average_global_score'] < quality_thresholds['min_global_score']:
+        metrics['alerts'].append(
+            f"Score global bajo ({metrics['average_global_score']:.3f} < {quality_thresholds['min_global_score']})"
+        )
+        metrics['meets_standards'] = False
+
+    quality_ratio = (
+        metrics['quality_distribution']['excellent'] + metrics['quality_distribution']['good']
+    ) / metrics['total_records']
+    if quality_ratio < quality_thresholds['min_quality_ratio']:
+        metrics['alerts'].append(
+            f"Proporción de calidad insuficiente ({quality_ratio:.1%} < {quality_thresholds['min_quality_ratio']:.0%})"
+        )
+        metrics['meets_standards'] = False
+
+    class_proportions = df['label'].value_counts(normalize=True)
+    for class_name, proportion in class_proportions.items():
+        if proportion > quality_thresholds['max_class_share']:
+            metrics['alerts'].append(
+                f"Clase '{class_name}' desbalanceada ({proportion:.1%} > {quality_thresholds['max_class_share']:.0%})"
+            )
+            metrics['meets_standards'] = False
+        class_count = int(len(df[df['label'] == class_name]))
+        if class_count < quality_thresholds['min_class_examples']:
+            metrics['alerts'].append(
+                f"Clase '{class_name}' insuficiente ({class_count} < {quality_thresholds['min_class_examples']})"
+            )
+            metrics['meets_standards'] = False
+
+    if metrics['quality_distribution']['poor'] > metrics['total_records'] * 0.3:
+        metrics['recommendations'].append("Considerar aumentar umbrales de calidad")
+    if metrics['classes_detected'] < 3:
+        metrics['recommendations'].append("Dataset puede estar muy sesgado - agregar más variedad")
+
+    return metrics
+
+
+def generate_comprehensive_report(results: Dict[str, any], df: pd.DataFrame) -> None:
+    print("📊 Estadísticas:")
+    print(f"   • Registros totales: {results['total_records']}")
+    print(f"   • Clases detectadas: {results['classes_detected']}")
+    print(f"   • Score global promedio: {results['average_global_score']:.3f}")
+    if results['quality_distribution']:
+        excellent = results['quality_distribution'].get('excellent', 0)
+        good = results['quality_distribution'].get('good', 0)
+        poor = results['quality_distribution'].get('poor', 0)
+        total = max(results['total_records'], 1)
         print(
-            f"🔍 [AUTO] Analizando {imagen_path.name}: {len(detecciones)} regiones heurísticas (confianza: {confianza_promedio:.2f})"
-        )
-    else:
-        print(f"🔍 [BASE] Textura {imagen_path.name}: marcada como base completa")
-        h, w = gray_image.shape
-        bbox = (0, 0, w, h)
-        coords = np.indices((h, w)).reshape(2, -1).T
-        detecciones.append(
-            VariantDetection(
-                coords=coords,
-                bbox=bbox,
-                label_key="base_texture",
-                detection_confidence=0.65,
-                is_heuristic=True,
-            )
+            f"   • Distribución de calidad: Excelente: {excellent/total:.0%}, "
+            f"Bueno: {good/total:.0%}, Pobre: {poor/total:.0%}"
         )
 
-    for deteccion in detecciones:
+    if not df.empty:
+        print("\n🏷️ Distribución por clases:")
+        for label, count in df['label'].value_counts().items():
+            share = count / len(df)
+            print(f"   • {label}: {count} registros ({share:.1%})")
+
+    if results['alerts']:
+        print("\n⚠️ Alertas:")
+        for alert in results['alerts']:
+            print(f"   • {alert}")
+
+    if results['recommendations']:
+        print("\n💡 Recomendaciones:")
+        for recommendation in results['recommendations']:
+            print(f"   • {recommendation}")
+
+    if results['meets_standards']:
+        print("\n✅ Cumple todos los estándares de calidad")
+    else:
+        print("\n❌ No cumple los estándares de calidad")
+
+
+def save_validation_samples(df: pd.DataFrame, n_samples: int = 20) -> None:
+    if df.empty:
+        return
+    output_dir = Path('validation_samples')
+    output_dir.mkdir(exist_ok=True)
+
+    ranked = df.sort_values('score_global', ascending=False)
+    if len(ranked) > n_samples:
+        indices = list(range(len(ranked)))
+        RNG.shuffle(indices)
+        selected_indices = sorted(indices[:n_samples])
+        sample_rows = ranked.iloc[selected_indices]
+    else:
+        sample_rows = ranked
+
+    for idx, row in sample_rows.iterrows():
+        image_path = Path(row['file_path'])
+        if not image_path.exists():
+            continue
         try:
-            record = build_dataset_record(
-                file_name=imagen_path.name,
-                bbox=deteccion.bbox,
-                coords=deteccion.coords,
-                label_key=deteccion.label_key,
-                detection_confidence=deteccion.detection_confidence,
-                is_heuristic=deteccion.is_heuristic,
-                color_array=img_array,
-                brightness_array=brightness_array,
-                gradient_magnitude=gradient_magnitude,
-                total_area=total_area,
-            )
-            resultados.append(record)
-        except ValueError:
+            with Image.open(image_path) as img:
+                box = (
+                    int(row['x']),
+                    int(row['y']),
+                    int(row['x'] + row['width']),
+                    int(row['y'] + row['height']),
+                )
+                crop = img.crop(box)
+                sample_name = f"{image_path.stem}_{idx}_{row['label']}.png"
+                crop.save(output_dir / sample_name)
+        except Exception:
             continue
 
-    return resultados
+
+def discover_and_classify_files(root: Path, include_input: bool) -> List[Dict]:
+    directories: List[Path] = []
+    if root.exists():
+        directories.append(root)
+    if include_input:
+        input_dir = Path('input')
+        if input_dir.exists():
+            directories.append(input_dir)
+
+    seen_paths: set[Path] = set()
+    discovered: List[Dict] = []
+    for directory in directories:
+        for path in directory.rglob('*.png'):
+            resolved = path.resolve()
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            info = analyze_filename_pattern(path.name)
+            base_path: Optional[Path] = None
+            if info['is_variant'] and info['base_name']:
+                candidate = path.with_name(f"{info['base_name']}{path.suffix}")
+                if candidate.exists():
+                    base_path = candidate
+                else:
+                    for lookup_dir in directories:
+                        alt = lookup_dir / f"{info['base_name']}{path.suffix}"
+                        if alt.exists():
+                            base_path = alt
+                            break
+            info.update({
+                'path': path,
+                'base_path': base_path,
+                'directory': directory,
+            })
+            discovered.append(info)
+    discovered.sort(key=lambda item: item['path'].name)
+    return discovered
 
 
-def es_archivo_variante(archivo_path: Path) -> bool:
-    """Return whether a file uses a known emissive suffix."""
-
-    return detectar_sufijo(archivo_path) is not None
-
-
-def procesar_archivo_seguro(archivo_path: Path) -> List[Dict[str, object]]:
-    """Procesa un archivo con manejo robusto de errores."""
-
-    try:
-        if es_archivo_variante(archivo_path):
-            registros = procesar_con_diferencia(archivo_path)
-            if registros:
-                return registros
-            # Fallback to heuristics if no base data available or no regions detected.
-            return procesar_archivo_base(archivo_path)
-        return procesar_archivo_base(archivo_path)
-    except Exception as exc:  # noqa: BLE001
-        print(f"❌ Error procesando {archivo_path.name}: {exc}")
-        return [
-            {
-                "file_name": archivo_path.name,
-                "x": float("nan"),
-                "y": float("nan"),
-                "width": float("nan"),
-                "height": float("nan"),
-                "label": "error",
-                "r_mean": float("nan"),
-                "g_mean": float("nan"),
-                "b_mean": float("nan"),
-                "r_std": float("nan"),
-                "g_std": float("nan"),
-                "b_std": float("nan"),
-                "brightness_mean": float("nan"),
-                "brightness_std": float("nan"),
-                "gradient_magnitude": float("nan"),
-                "aspect_ratio": float("nan"),
-                "area_ratio": float("nan"),
-                "is_heuristic": True,
-                "detection_confidence": 0.0,
-                "split": "unassigned",
-            }
-        ]
+def apply_region_postprocessing(region: Dict, file_info: Dict, image_path: Path) -> Dict:
+    features = extract_region_features(region, image_path)
+    region.update(features)
+    quality_scores = comprehensive_quality_assessment(region, image_path, file_info)
+    region.update(quality_scores)
+    region['file_name'] = image_path.name
+    region['file_path'] = str(image_path)
+    region.pop('context_factors', None)
+    return region
 
 
-def balancear_dataset(df: pd.DataFrame) -> pd.DataFrame:
-    """Balancea el dataset limitando clases dominantes y ampliando clases pequeñas."""
+def build_records_for_file(file_info: Dict, config: Dict) -> List[Dict]:
+    path: Path = file_info['path']
+    regions: List[Dict]
 
-    if df.empty:
-        return df
-
-    datasets_balanceados: List[pd.DataFrame] = []
-    conteo_clases = Counter(df["label"])
-
-    MAXIMO_POR_CLASE = 1000
-    MINIMO_POR_CLASE = 50
-    OBJETIVO_POR_CLASE = 200
-
-    for clase, count in conteo_clases.items():
-        datos_clase = df[df["label"] == clase].copy()
-
-        if count > MAXIMO_POR_CLASE:
-            datos_clase = datos_clase.sample(MAXIMO_POR_CLASE, random_state=42)
-            print(f"📉 Submuestreando {clase}: {count} → {MAXIMO_POR_CLASE}")
-        elif count < MINIMO_POR_CLASE:
-            if count > 0:
-                factor_sobre = MINIMO_POR_CLASE // count + 1
-                datos_clase = pd.concat([datos_clase] * factor_sobre, ignore_index=True)
-                datos_clase = datos_clase.head(MINIMO_POR_CLASE)
-                print(f"📈 Sobremuestreando {clase}: {count} → {MINIMO_POR_CLASE}")
-
-        # Ajustar hacia el objetivo ideal si es posible.
-        if len(datos_clase) > OBJETIVO_POR_CLASE:
-            datos_clase = datos_clase.sample(OBJETIVO_POR_CLASE, random_state=42)
-        elif len(datos_clase) < OBJETIVO_POR_CLASE:
-            repeticiones = int(math.ceil(OBJETIVO_POR_CLASE / max(len(datos_clase), 1)))
-            datos_clase = pd.concat([datos_clase] * max(repeticiones, 1), ignore_index=True)
-            datos_clase = datos_clase.head(OBJETIVO_POR_CLASE)
-
-        datasets_balanceados.append(datos_clase)
-
-    if not datasets_balanceados:
-        return df
-
-    return pd.concat(datasets_balanceados, ignore_index=True)
-
-
-def validar_calidad_dataset(df: pd.DataFrame) -> bool:
-    """Valida que el dataset cumple con los criterios de calidad."""
-
-    if df.empty:
-        print("=== VALIDACIÓN DE CALIDAD DEL DATASET ===")
-        print("Dataset vacío: no se pueden validar criterios.")
-        return False
-
-    conteo = df["label"].value_counts()
-    total = len(df)
-
-    print("=== VALIDACIÓN DE CALIDAD DEL DATASET ===")
-    print(f"Total de registros: {total}")
-    print("Distribución por clases:")
-
-    criterios_cumplidos = True
-
-    for clase, count in conteo.items():
-        porcentaje = (count / total) * 100
-        print(f"  {clase}: {count} ejemplos ({porcentaje:.1f}%)")
-        if porcentaje > 40:
-            print("  ⚠️  DEMASIADO GRANDE (>40%)")
-            criterios_cumplidos = False
-        if count < 50:
-            print("  ⚠️  MUY PEQUEÑO (<50 ejemplos)")
-            criterios_cumplidos = False
-
-    train_count = int((df["split"] == "train").sum())
-    test_count = int((df["split"] == "test").sum())
-    ratio_test = test_count / total if total else 0
-
-    print(f"\nDivisión train/test: {train_count}/{test_count} ({ratio_test:.1%})")
-    if not (0.15 <= ratio_test <= 0.25):
-        print("⚠️  División train/test fuera del rango 15-25%")
-        criterios_cumplidos = False
-
-    detecciones_heuristicas = df[df["is_heuristic"]]
-    if not detecciones_heuristicas.empty:
-        confianza_media = float(detecciones_heuristicas["detection_confidence"].mean())
-        print(f"Confianza promedio detecciones heurísticas: {confianza_media:.2f}")
-        if confianza_media <= 0.5:
-            print("⚠️  Confianza promedio heurística ≤ 0.5")
-            criterios_cumplidos = False
-
-    if criterios_cumplidos:
-        print("✅ Dataset cumple todos los criterios de calidad")
+    if file_info['is_variant'] and file_info.get('base_path') and file_info['base_path'].exists():
+        regions = process_variant_pair(file_info['base_path'], path, file_info, config)
     else:
-        print("❌ Dataset necesita ajustes de balanceo")
+        regions = heuristic_region_detection(path, file_info, config)
 
-    return criterios_cumplidos
+    records: List[Dict] = []
+    for region in regions:
+        try:
+            processed = apply_region_postprocessing(region, file_info, path)
+            records.append(processed)
+        except Exception as exc:
+            print(f"❌ Error procesando región en {path.name}: {exc}")
+    return records
 
 
 def main() -> None:
-    archivos_png = iter_texture_files()
-    if not archivos_png:
-        print("No se encontraron archivos PNG para procesar.")
-        return
+    print("🚀 INICIANDO GENERACIÓN DE DATASET CON CONTROL DE CALIDAD")
+    print("=" * 70)
 
-    registros: List[Dict[str, object]] = []
-
-    for archivo in archivos_png:
-        registros.extend(procesar_archivo_seguro(archivo))
-
-    if not registros:
-        print("No se generaron registros para el dataset.")
-        return
-
-    df = pd.DataFrame(registros, columns=COLUMNAS_DATASET)
-
-    df_balanceado = balancear_dataset(df)
-
-    if df_balanceado.empty:
-        print("No se pudo balancear el dataset: sin datos disponibles.")
-        return
-
-    train_df, test_df = train_test_split(
-        df_balanceado,
-        test_size=0.2,
-        random_state=42,
-        stratify=df_balanceado["label"] if df_balanceado["label"].nunique() > 1 else None,
+    parser = argparse.ArgumentParser(
+        description='Generar dataset de texturas Minecraft con calidad garantizada'
     )
+    parser.add_argument('--root', default='toLearn', help='Directorio raíz con texturas')
+    parser.add_argument('--include-input', action='store_true', default=True, help='Incluir directorio input/')
+    parser.add_argument('--quality-report', action='store_true', default=True, help='Generar reporte de calidad')
+    parser.add_argument('--save-samples', action='store_true', default=True, help='Guardar muestras visuales')
+    args = parser.parse_args()
 
-    train_df = train_df.copy()
-    test_df = test_df.copy()
-    train_df["split"] = "train"
-    test_df["split"] = "test"
+    config = CONFIG
 
-    df_final = pd.concat([train_df, test_df], ignore_index=True)
+    print("🔍 Descubriendo y clasificando archivos...")
+    all_files = discover_and_classify_files(Path(args.root), args.include_input)
+    if not all_files:
+        print("❌ No se encontraron archivos PNG válidos")
+        return
 
-    df_final.to_csv("data.csv", index=False)
+    print(f"📁 Archivos encontrados: {len(all_files)}")
+    print("🔄 Procesando archivos con pipelines inteligentes...")
 
-    validar_calidad_dataset(df_final)
+    all_regions: List[Dict] = []
+    for file_info in all_files:
+        try:
+            regions = build_records_for_file(file_info, config)
+            all_regions.extend(regions)
+        except Exception as exc:
+            print(f"❌ Error procesando {file_info['path'].name}: {exc}")
 
-    print(f"🎯 Dataset final guardado: {len(df_final)} registros")
+    if not all_regions:
+        print("❌ No se generaron regiones válidas")
+        return
+
+    df_initial = pd.DataFrame(all_regions)
+    print(f"📦 Dataset inicial: {len(df_initial)} regiones")
+
+    print("\n" + "=" * 70)
+    print("🔬 APLICANDO CONTROL DE CALIDAD EN CASCADA")
+    print("=" * 70)
+
+    df_geometric = apply_geometric_filters(df_initial, config)
+    print(f"📏 Filtro geométrico: {len(df_initial)} → {len(df_geometric)}")
+
+    df_quality = apply_quality_filters(df_geometric, config)
+    print(f"🎯 Filtro de calidad: {len(df_geometric)} → {len(df_quality)}")
+
+    df_deduped = deduplicate_regions(df_quality, config)
+    print(f"🧹 Eliminación de duplicados: {len(df_quality)} → {len(df_deduped)}")
+
+    print("\n⚖️ APLICANDO BALANCEO INTELIGENTE")
+    df_balanced = intelligent_balancing(df_deduped, config)
+    print(f"📊 Dataset balanceado: {len(df_deduped)} → {len(df_balanced)}")
+
+    print("\n📋 VALIDACIÓN FINAL DE CALIDAD")
+    validation_results = enhanced_quality_validation(df_balanced, config)
+
+    print("\n" + "=" * 70)
+    print("📊 REPORTE FINAL DE CALIDAD")
+    print("=" * 70)
+    generate_comprehensive_report(validation_results, df_balanced)
+
+    if validation_results['meets_standards']:
+        train_df, test_df = train_test_split(
+            df_balanced,
+            test_size=0.2,
+            random_state=42,
+            stratify=df_balanced['label'] if df_balanced['label'].nunique() > 1 else None,
+        )
+        train_df = train_df.copy()
+        test_df = test_df.copy()
+        train_df['split'] = 'train'
+        test_df['split'] = 'test'
+        df_final = pd.concat([train_df, test_df], ignore_index=True)
+        df_final.to_csv('data.csv', index=False)
+
+        print("\n💾 DATASET GUARDADO EXITOSAMENTE")
+        print(f"   • Registros totales: {len(df_final)}")
+        print(f"   • Entrenamiento: {len(train_df)}")
+        print(f"   • Prueba: {len(test_df)}")
+        print(f"   • Score global promedio: {validation_results['average_global_score']:.3f}")
+
+        if args.save_samples:
+            save_validation_samples(df_final, n_samples=20)
+            print("   🔍 Muestras de validación guardadas en 'validation_samples/'")
+        print("✅ PROCESO COMPLETADO EXITOSAMENTE")
+    else:
+        print("\n❌ EL DATASET NO CUMPLE LOS ESTÁNDARES DE CALIDAD")
+        print("   Alertas identificadas:")
+        for alert in validation_results['alerts']:
+            print(f"   • {alert}")
+        if validation_results['recommendations']:
+            print("\n   💡 Recomendaciones:")
+            for recommendation in validation_results['recommendations']:
+                print(f"   • {recommendation}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
