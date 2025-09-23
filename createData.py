@@ -13,6 +13,7 @@ from collections import defaultdict
 import random
 from typing import Dict, List, Tuple, Optional
 import argparse
+from copy import deepcopy
 from scipy import ndimage
 import math
 from sklearn.model_selection import train_test_split
@@ -44,6 +45,36 @@ CONFIG: Dict[str, Dict[str, Dict[str, float]]] = {
     },
 }
 
+BIG_MOBS: Tuple[str, ...] = ("dragon", "warden", "golem", "wither", "elder")
+
+
+def prepare_config_for_file(file_info: Dict, base_config: Dict) -> Tuple[Dict, bool]:
+    """Genera una configuración adaptada cuando aplica reglas especiales."""
+
+    if not file_info.get('uses_big_mob_rules'):
+        return base_config, False
+
+    config_copy = deepcopy(base_config)
+    config_copy['thresholds'] = dict(config_copy['thresholds'])
+    config_copy['limits'] = dict(config_copy['limits'])
+    config_copy['thresholds']['area_max_ratio'] = 0.60
+    config_copy['limits']['max_boxes_per_image'] = 100
+    config_copy['thresholds']['score_global_min'] = 0.50
+    config_copy['thresholds']['iou_dedup'] = 0.85
+    path = file_info.get('path')
+    file_label = path.name if isinstance(path, Path) else file_info.get('base_name', 'desconocido')
+    print(f"🛡️ Reglas especiales de mob grande aplicadas a {file_label}")
+    return config_copy, True
+
+
+def apply_big_mob_overrides(region: Dict) -> None:
+    """Inyecta parámetros relajados para texturas de mobs grandes."""
+
+    region['big_mob_special'] = True
+    region['area_max_ratio_override'] = 0.60
+    region['score_global_min_override'] = 0.50
+    region['iou_dedup_override'] = 0.85
+
 # Mapeo de etiquetas para variantes emisivas
 VARIANT_LABELS: Dict[str, str] = {
     'e': 'emissive',
@@ -65,10 +96,17 @@ IMAGE_CACHE: Dict[Path, Dict[str, np.ndarray]] = {}
 RNG = random.Random(42)
 
 
+def _matches_big_mob_keyword(name: str, keyword: str) -> bool:
+    if keyword == 'wither' and 'wither_skeleton' in name:
+        return False
+    return keyword in name
+
+
 def analyze_filename_pattern(filename: str) -> Dict[str, any]:
     """Analiza patrones en nombres de archivo para clasificación inteligente."""
 
     stem = Path(filename).stem.lower()
+    name_lower = filename.lower()
 
     BLOCK_ITEMS = {'beam', 'shield', 'sword', 'bricks', 'wood', 'log', 'planks',
                    'door', 'bed', 'stone', 'ore', 'acacia', 'birch', 'spruce',
@@ -78,7 +116,12 @@ def analyze_filename_pattern(filename: str) -> Dict[str, any]:
     SMALL_MOBS = {'zombie', 'skeleton', 'creeper', 'spider', 'cow', 'pig', 'sheep'}
 
     is_block_item = any(keyword in stem for keyword in BLOCK_ITEMS)
-    is_large_mob = any(keyword in stem for keyword in LARGE_MOBS)
+    is_big_mob_special = any(_matches_big_mob_keyword(name_lower, keyword) for keyword in BIG_MOBS)
+
+    def _matches_large(keyword: str) -> bool:
+        return _matches_big_mob_keyword(name_lower, keyword)
+
+    is_large_mob = any(_matches_large(keyword) for keyword in LARGE_MOBS) or is_big_mob_special
     is_small_mob = any(keyword in stem for keyword in SMALL_MOBS)
 
     variant_suffixes = ['_e', '_eyes', '_heart', '_spots', '_crackiness']
@@ -101,6 +144,7 @@ def analyze_filename_pattern(filename: str) -> Dict[str, any]:
         'base_name': base_name,
         'suffix': suffix_used,
         'requires_special_rules': is_large_mob or is_block_item,
+        'uses_big_mob_rules': is_big_mob_special,
     }
 
 
@@ -160,10 +204,11 @@ def find_connected_components_adaptive(binary_mask: np.ndarray, file_info: Dict,
     area_min = config['thresholds']['area_min_pixels']
     area_max_ratio = config['thresholds']['area_max_ratio']
 
-    if file_info['is_large_mob']:
-        area_max_ratio *= 1.4
-    if file_info['is_block_item']:
-        area_max_ratio *= 0.7
+    if not file_info.get('big_mob_rules_applied'):
+        if file_info['is_large_mob']:
+            area_max_ratio *= 1.4
+        if file_info['is_block_item']:
+            area_max_ratio *= 0.7
 
     regions: List[Dict] = []
     for idx, slc in enumerate(slices, start=1):
@@ -320,6 +365,11 @@ def process_variant_pair(base_path: Path, variant_path: Path, file_info: Dict, c
     merged_regions = merge_regions_intelligent(regions, diff, file_info, config)
     final_regions = apply_region_limits(merged_regions, diff, file_info, config)
 
+    if file_info.get('big_mob_rules_applied') and not final_regions:
+        fallback_region = create_base_region_with_context(variant_img.size, file_info)
+        final_regions = [fallback_region]
+        print(f"🛡️ {variant_path.name}: sin regiones tras filtros, se fuerza bounding box base para mob grande")
+
     print(f"🔍 {variant_path.name}: {len(regions)} → {len(merged_regions)} → {len(final_regions)} regiones")
     return final_regions
 
@@ -369,11 +419,15 @@ def heuristic_region_detection(image_path: Path, file_info: Dict, config: Dict) 
                 reverse=True,
             )[:config['limits']['max_boxes_per_image']]
 
+    forced_base = False
     if not classified_regions:
         base_region = create_base_region_with_context(img.size, file_info)
         classified_regions.append(base_region)
+        forced_base = True
 
     avg_confidence = np.mean([r['detection_confidence'] for r in classified_regions]) if classified_regions else 0
+    if file_info.get('big_mob_rules_applied') and forced_base:
+        print(f"🛡️ {image_path.name}: sin detecciones, se agrega bounding box base para mob grande")
     print(f"🔍 [AUTO] {image_path.name}: {len(classified_regions)} regiones (conf: {avg_confidence:.2f})")
     return classified_regions
 
@@ -642,11 +696,15 @@ def apply_geometric_filters(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
         return df
     area_min = config['thresholds']['area_min_pixels']
     area_max_ratio = config['thresholds']['area_max_ratio']
+    if 'area_max_ratio_override' in df.columns:
+        area_max_series = df['area_max_ratio_override'].fillna(area_max_ratio)
+    else:
+        area_max_series = pd.Series(area_max_ratio, index=df.index)
     mask_valid = (
         (df['width'] > 0)
         & (df['height'] > 0)
         & (df['area'] >= area_min)
-        & ((df['area_ratio'] <= area_max_ratio * 1.2) | (df['label'] == 'base_texture'))
+        & ((df['area_ratio'] <= area_max_series * 1.2) | (df['label'] == 'base_texture'))
     )
     return df[mask_valid].reset_index(drop=True)
 
@@ -655,11 +713,15 @@ def apply_quality_filters(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
     if df.empty:
         return df
     thresholds = config['thresholds']
+    if 'score_global_min_override' in df.columns:
+        min_score_series = df['score_global_min_override'].fillna(thresholds['score_global_min'])
+    else:
+        min_score_series = pd.Series(thresholds['score_global_min'], index=df.index)
     mask = (
         (df['detection_confidence'] >= thresholds['conf_min'])
         & (df['semantic_coherence'] >= thresholds['sem_min'])
         & (df['visual_quality'] >= thresholds['vis_min'])
-        & (df['score_global'] >= thresholds['score_global_min'])
+        & (df['score_global'] >= min_score_series)
     )
     return df[mask].reset_index(drop=True)
 
@@ -670,6 +732,20 @@ def deduplicate_regions(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
 
     df_sorted = df.sort_values('score_global', ascending=False).reset_index(drop=True)
     keep_indices: List[int] = []
+    default_iou = config['thresholds']['iou_dedup']
+    overrides = df_sorted['iou_dedup_override'] if 'iou_dedup_override' in df_sorted.columns else None
+
+    def _threshold_for_pair(idx_a: int, idx_b: int) -> float:
+        def _value(series: Optional[pd.Series], idx: int) -> float:
+            if series is None:
+                return default_iou
+            val = series.iloc[idx]
+            if pd.isna(val):
+                return default_iou
+            return float(val)
+
+        return max(_value(overrides, idx_a), _value(overrides, idx_b))
+
     for idx, row in df_sorted.iterrows():
         bbox_row = {
             'x': row['x'],
@@ -686,7 +762,7 @@ def deduplicate_regions(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
                     'width': df_sorted.loc[keep_idx, 'width'],
                     'height': df_sorted.loc[keep_idx, 'height'],
                 },
-            ) <= config['thresholds']['iou_dedup']
+            ) <= _threshold_for_pair(idx, keep_idx)
             for keep_idx in keep_indices
         ):
             keep_indices.append(idx)
@@ -929,10 +1005,20 @@ def build_records_for_file(file_info: Dict, config: Dict) -> List[Dict]:
     path: Path = file_info['path']
     regions: List[Dict]
 
+    config_for_file, big_rules_active = prepare_config_for_file(file_info, config)
+    file_info['big_mob_rules_applied'] = big_rules_active
+
     if file_info['is_variant'] and file_info.get('base_path') and file_info['base_path'].exists():
-        regions = process_variant_pair(file_info['base_path'], path, file_info, config)
+        regions = process_variant_pair(file_info['base_path'], path, file_info, config_for_file)
     else:
-        regions = heuristic_region_detection(path, file_info, config)
+        regions = heuristic_region_detection(path, file_info, config_for_file)
+
+    if big_rules_active:
+        for region in regions:
+            apply_big_mob_overrides(region)
+    else:
+        for region in regions:
+            region['big_mob_special'] = False
 
     records: List[Dict] = []
     for region in regions:
