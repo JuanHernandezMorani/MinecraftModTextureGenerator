@@ -22,15 +22,17 @@ from sklearn.model_selection import train_test_split
 CONFIG: Dict[str, Dict[str, Dict[str, float]]] = {
     'thresholds': {
         'area_min_pixels': 25,
-        'area_max_ratio': 0.30,
+        'area_max_ratio': 0.15,
         'iou_merge': 0.35,
         'iou_dedup': 0.70,
-        'score_global_min': 0.60,
-        'conf_min': 0.50,
-        'sem_min': 0.40,
-        'vis_min': 0.30,
+        'score_global_min': 0.70,
+        'conf_min': 0.55,
+        'sem_min': 0.45,
+        'vis_min': 0.35,
         'diff_threshold_ratio': 0.25,
         'heuristic_threshold_ratio': 0.70,
+        'aspect_ratio_min': 0.20,
+        'aspect_ratio_max': 5.0,
     },
     'limits': {
         'max_per_class': 1000,
@@ -47,6 +49,35 @@ CONFIG: Dict[str, Dict[str, Dict[str, float]]] = {
 
 BIG_MOBS: Tuple[str, ...] = ("dragon", "warden", "golem", "wither", "elder")
 
+QUALITY_THRESHOLDS: Dict[str, float] = {
+    'score_global_min': 0.70,
+    'conf_min': 0.55,
+    'visual_min': 0.35,
+    'semantic_min': 0.45,
+}
+
+ORIGINAL_SUFFIXES: Dict[str, str] = {
+    '_e': 'e',
+    '_eyes': 'eyes',
+    '_heart': 'heart',
+    '_spots': 'spots',
+}
+
+AUTO_SUFFIXES: Dict[str, str] = {
+    '_e': 'auto_glow',
+    '_eyes': 'auto_eyes',
+    '_heart': 'auto_glow',
+    '_spots': 'auto_glow',
+    '_crackiness': 'auto_cracks',
+}
+
+
+def is_big_mob(file_name: str) -> bool:
+    name = file_name.lower()
+    if 'wither' in name and 'skeleton' in name:
+        return False
+    return any(mob in name for mob in BIG_MOBS)
+
 
 def prepare_config_for_file(file_info: Dict, base_config: Dict) -> Tuple[Dict, bool]:
     """Genera una configuración adaptada cuando aplica reglas especiales."""
@@ -57,10 +88,10 @@ def prepare_config_for_file(file_info: Dict, base_config: Dict) -> Tuple[Dict, b
     config_copy = deepcopy(base_config)
     config_copy['thresholds'] = dict(config_copy['thresholds'])
     config_copy['limits'] = dict(config_copy['limits'])
-    config_copy['thresholds']['area_max_ratio'] = 0.60
-    config_copy['limits']['max_boxes_per_image'] = 100
-    config_copy['thresholds']['score_global_min'] = 0.50
-    config_copy['thresholds']['iou_dedup'] = 0.85
+    config_copy['thresholds']['area_max_ratio'] = 0.40
+    config_copy['thresholds']['aspect_ratio_min'] = 0.15
+    config_copy['thresholds']['aspect_ratio_max'] = 6.0
+    config_copy['limits']['max_boxes_per_image'] = 60
     path = file_info.get('path')
     file_label = path.name if isinstance(path, Path) else file_info.get('base_name', 'desconocido')
     print(f"🛡️ Reglas especiales de mob grande aplicadas a {file_label}")
@@ -71,19 +102,11 @@ def apply_big_mob_overrides(region: Dict) -> None:
     """Inyecta parámetros relajados para texturas de mobs grandes."""
 
     region['big_mob_special'] = True
-    region['area_max_ratio_override'] = 0.60
-    region['score_global_min_override'] = 0.50
-    region['iou_dedup_override'] = 0.85
+    region['area_max_ratio_override'] = 0.40
+    region['aspect_ratio_min_override'] = 0.15
+    region['aspect_ratio_max_override'] = 6.0
 
 # Mapeo de etiquetas para variantes emisivas
-VARIANT_LABELS: Dict[str, str] = {
-    'e': 'emissive',
-    'eyes': 'emissive_eyes',
-    'heart': 'emissive_heart',
-    'spots': 'emissive_spots',
-    'crackiness': 'emissive_cracks',
-}
-
 VARIANT_SUFFIXES: Tuple[Tuple[str, str], ...] = (
     ('_crackiness', 'crackiness'),
     ('_spots', 'spots'),
@@ -97,8 +120,8 @@ RNG = random.Random(42)
 
 
 def _matches_big_mob_keyword(name: str, keyword: str) -> bool:
-    if keyword == 'wither' and 'wither_skeleton' in name:
-        return False
+    if keyword == 'wither':
+        return 'wither' in name and 'skeleton' not in name
     return keyword in name
 
 
@@ -116,10 +139,12 @@ def analyze_filename_pattern(filename: str) -> Dict[str, any]:
     SMALL_MOBS = {'zombie', 'skeleton', 'creeper', 'spider', 'cow', 'pig', 'sheep'}
 
     is_block_item = any(keyword in stem for keyword in BLOCK_ITEMS)
-    is_big_mob_special = any(_matches_big_mob_keyword(name_lower, keyword) for keyword in BIG_MOBS)
+    is_big_mob_special = is_big_mob(filename)
 
     def _matches_large(keyword: str) -> bool:
-        return _matches_big_mob_keyword(name_lower, keyword)
+        if keyword in BIG_MOBS:
+            return _matches_big_mob_keyword(name_lower, keyword)
+        return keyword in name_lower
 
     is_large_mob = any(_matches_large(keyword) for keyword in LARGE_MOBS) or is_big_mob_special
     is_small_mob = any(keyword in stem for keyword in SMALL_MOBS)
@@ -203,6 +228,8 @@ def find_connected_components_adaptive(binary_mask: np.ndarray, file_info: Dict,
 
     area_min = config['thresholds']['area_min_pixels']
     area_max_ratio = config['thresholds']['area_max_ratio']
+    aspect_ratio_min = config['thresholds'].get('aspect_ratio_min', 0.2)
+    aspect_ratio_max = config['thresholds'].get('aspect_ratio_max', 5.0)
 
     if not file_info.get('big_mob_rules_applied'):
         if file_info['is_large_mob']:
@@ -215,23 +242,48 @@ def find_connected_components_adaptive(binary_mask: np.ndarray, file_info: Dict,
         if slc is None:
             continue
         region_mask = labeled[slc] == idx
-        area = int(region_mask.sum())
-        if area < area_min:
+        dilated_mask = ndimage.binary_dilation(region_mask, structure=np.ones((3, 3), dtype=bool))
+        coords = np.argwhere(dilated_mask)
+        if coords.size == 0:
             continue
-        area_ratio = area / total_area if total_area else 0.0
+        min_row, min_col = coords.min(axis=0)
+        max_row, max_col = coords.max(axis=0)
+        y0 = slc[0].start + int(min_row)
+        y1 = slc[0].start + int(max_row) + 1
+        x0 = slc[1].start + int(min_col)
+        x1 = slc[1].start + int(max_col) + 1
+        y0 = max(0, y0)
+        x0 = max(0, x0)
+        y1 = min(height, y1)
+        x1 = min(width, x1)
+        width_box = int(max(0, x1 - x0))
+        height_box = int(max(0, y1 - y0))
+        if width_box <= 0 or height_box <= 0:
+            continue
+        bbox_area = width_box * height_box
+        if bbox_area < area_min:
+            continue
+        area_ratio = bbox_area / total_area if total_area else 0.0
         if area_ratio > area_max_ratio:
             continue
+        aspect_ratio = float(width_box / height_box)
+        aspect_min = aspect_ratio_min
+        aspect_max = aspect_ratio_max
+        if file_info.get('big_mob_rules_applied'):
+            aspect_min = min(aspect_min, 0.15)
+            aspect_max = max(aspect_max, 6.0)
+        if aspect_ratio < aspect_min or aspect_ratio > aspect_max:
+            continue
 
-        y0, y1 = slc[0].start, slc[0].stop
-        x0, x1 = slc[1].start, slc[1].stop
         region_dict = {
             'x': int(x0),
             'y': int(y0),
-            'width': int(x1 - x0),
-            'height': int(y1 - y0),
-            'area': area,
+            'width': width_box,
+            'height': height_box,
+            'area': bbox_area,
             'area_ratio': area_ratio,
-            'mask': region_mask.astype(bool),
+            'aspect_ratio': aspect_ratio,
+            'mask': dilated_mask.astype(bool),
             'slice': slc,
         }
         regions.append(region_dict)
@@ -322,7 +374,11 @@ def apply_region_limits(regions: List[Dict], diff_array: np.ndarray, file_info: 
         values = patch.reshape(-1)
         region['detection_confidence'] = float(np.clip(values.mean() / 255.0 if values.size else 0.0, 0.0, 1.0))
         suffix = file_info.get('suffix') or ''
-        region['label'] = VARIANT_LABELS.get(suffix.strip('_') or 'e', 'emissive')
+        label_original = ORIGINAL_SUFFIXES.get(suffix, '')
+        label_auto = AUTO_SUFFIXES.get(suffix, 'auto_glow')
+        region['label_original'] = label_original
+        region['label_auto'] = label_auto
+        region['label'] = label_auto
         region['is_heuristic'] = False
         region['source'] = 'difference'
         region.pop('mask', None)
@@ -454,7 +510,7 @@ def classify_region_with_context(region: Dict, gray_image: np.ndarray, color_ima
     block_item_penalty = 0.6 if file_info['is_block_item'] else 1.0
     top_position_bonus = 1.5 if y_relative < 0.4 else 1.0
 
-    label = 'unknown'
+    label_auto = 'unknown'
     confidence = 0.3
 
     if (
@@ -464,7 +520,7 @@ def classify_region_with_context(region: Dict, gray_image: np.ndarray, color_ima
         0.5 <= aspect_ratio <= 2.0 and
         not file_info['is_block_item']
     ):
-        label = 'auto_eyes'
+        label_auto = 'auto_eyes'
         base_confidence = 0.8 * min(1.0, (brightness_mean - 200) / 55 if brightness_mean > 200 else 0.0)
         confidence = base_confidence * top_position_bonus * large_mob_bonus * block_item_penalty
     elif (
@@ -473,7 +529,7 @@ def classify_region_with_context(region: Dict, gray_image: np.ndarray, color_ima
         area <= 500 * large_mob_bonus and
         aspect_ratio <= 5.0
     ):
-        label = 'auto_glow'
+        label_auto = 'auto_glow'
         confidence = 0.7 * large_mob_bonus * block_item_penalty
     elif (
         brightness_std > 50 and
@@ -481,7 +537,7 @@ def classify_region_with_context(region: Dict, gray_image: np.ndarray, color_ima
         area <= 300 and
         not file_info['is_block_item']
     ):
-        label = 'auto_cracks'
+        label_auto = 'auto_cracks'
         confidence = 0.6
 
     min_confidence = 0.3 * block_item_penalty
@@ -489,7 +545,9 @@ def classify_region_with_context(region: Dict, gray_image: np.ndarray, color_ima
         return None
 
     region.update({
-        'label': label,
+        'label_auto': label_auto,
+        'label_original': '',
+        'label': label_auto,
         'detection_confidence': float(min(0.95, confidence)),
         'source': 'heuristic',
         'is_heuristic': True,
@@ -516,6 +574,8 @@ def create_base_region_with_context(image_size: Tuple[int, int], file_info: Dict
         'height': height,
         'area': width * height,
         'area_ratio': 1.0,
+        'label_auto': 'base_texture',
+        'label_original': '',
         'label': 'base_texture',
         'detection_confidence': detection_conf,
         'is_heuristic': True,
@@ -606,6 +666,8 @@ def calculate_geometric_quality(region: Dict, file_info: Dict) -> float:
 
     ratio_score = np.clip((area_ratio - min_ratio) / max(max_ratio - min_ratio, 1e-6), 0.0, 1.0)
     aspect_penalty = np.clip(1.0 - abs(math.log(max(aspect_ratio, 1e-3))), 0.0, 1.0)
+    if file_info.get('big_mob_rules_applied'):
+        aspect_penalty = max(aspect_penalty, 0.6)
     return float(0.7 * ratio_score + 0.3 * aspect_penalty)
 
 
@@ -618,7 +680,8 @@ def calculate_visual_quality_robust(region: Dict) -> float:
 
 
 def evaluate_semantic_coherence_adaptive(region: Dict, file_info: Dict) -> float:
-    label = region.get('label', 'unknown')
+    label = region.get('label_auto', region.get('label', 'unknown'))
+    original_label = region.get('label_original', '')
     base_score = 0.4
     if label == 'auto_eyes' and not file_info['is_block_item']:
         base_score = 0.75
@@ -626,11 +689,11 @@ def evaluate_semantic_coherence_adaptive(region: Dict, file_info: Dict) -> float
         base_score = 0.65
     elif label == 'auto_cracks':
         base_score = 0.55
-    elif label.startswith('emissive'):
-        base_score = 0.8
     elif label == 'base_texture':
         base_score = 0.6
 
+    if original_label:
+        base_score += 0.05
     if file_info['is_large_mob'] and label in {'auto_eyes', 'auto_glow'}:
         base_score += 0.1
     if file_info['is_block_item'] and label == 'base_texture':
@@ -642,7 +705,8 @@ def predict_training_utility(region: Dict, file_info: Dict) -> float:
     conf = region.get('detection_confidence', 0.5)
     area_ratio = region.get('area_ratio', 0.0)
     utility = 0.6 * conf + 0.4 * np.clip(area_ratio / CONFIG['thresholds']['area_max_ratio'], 0.0, 1.0)
-    if region.get('label') == 'base_texture' and file_info['is_block_item']:
+    label_auto = region.get('label_auto', region.get('label', ''))
+    if label_auto == 'base_texture' and file_info['is_block_item']:
         utility *= 0.9
     return float(np.clip(utility, 0.0, 1.0))
 
@@ -700,11 +764,23 @@ def apply_geometric_filters(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
         area_max_series = df['area_max_ratio_override'].fillna(area_max_ratio)
     else:
         area_max_series = pd.Series(area_max_ratio, index=df.index)
+    aspect_min = config['thresholds'].get('aspect_ratio_min', 0.2)
+    aspect_max = config['thresholds'].get('aspect_ratio_max', 5.0)
+    if 'aspect_ratio_min_override' in df.columns:
+        aspect_min_series = df['aspect_ratio_min_override'].fillna(aspect_min)
+    else:
+        aspect_min_series = pd.Series(aspect_min, index=df.index)
+    if 'aspect_ratio_max_override' in df.columns:
+        aspect_max_series = df['aspect_ratio_max_override'].fillna(aspect_max)
+    else:
+        aspect_max_series = pd.Series(aspect_max, index=df.index)
     mask_valid = (
         (df['width'] > 0)
         & (df['height'] > 0)
         & (df['area'] >= area_min)
-        & ((df['area_ratio'] <= area_max_series * 1.2) | (df['label'] == 'base_texture'))
+        & ((df['area_ratio'] <= area_max_series) | (df['label'] == 'base_texture'))
+        & (df['aspect_ratio'] >= aspect_min_series)
+        & (df['aspect_ratio'] <= aspect_max_series)
     )
     return df[mask_valid].reset_index(drop=True)
 
@@ -880,11 +956,22 @@ def enhanced_quality_validation(df: pd.DataFrame, config: Dict) -> Dict[str, any
     return metrics
 
 
-def generate_comprehensive_report(results: Dict[str, any], df: pd.DataFrame) -> None:
+def generate_comprehensive_report(
+    results: Dict[str, any],
+    df: pd.DataFrame,
+    filter_stats: Optional[Dict[str, float]] = None,
+    label_summary: Optional[Dict[str, Dict[str, int]]] = None,
+) -> None:
     print("📊 Estadísticas:")
     print(f"   • Registros totales: {results['total_records']}")
     print(f"   • Clases detectadas: {results['classes_detected']}")
     print(f"   • Score global promedio: {results['average_global_score']:.3f}")
+    if filter_stats:
+        geom_pct = filter_stats.get('geom_removed_pct', 0.0)
+        qual_pct = filter_stats.get('quality_removed_pct', 0.0)
+        print(
+            f"   • Registros descartados - Geométrico: {geom_pct:.1f}% | Calidad: {qual_pct:.1f}%"
+        )
     if results['quality_distribution']:
         excellent = results['quality_distribution'].get('excellent', 0)
         good = results['quality_distribution'].get('good', 0)
@@ -900,6 +987,35 @@ def generate_comprehensive_report(results: Dict[str, any], df: pd.DataFrame) -> 
         for label, count in df['label'].value_counts().items():
             share = count / len(df)
             print(f"   • {label}: {count} registros ({share:.1%})")
+    if label_summary:
+        auto_labels = label_summary.get('auto', {})
+        original_labels = label_summary.get('original', {})
+        if auto_labels:
+            print("\n🤖 Etiquetas automáticas:")
+            for label, count in auto_labels.items():
+                print(f"   • {label}: {count}")
+            if len(auto_labels) < 4:
+                print(
+                    f"\n⚠️ Sólo se detectaron {len(auto_labels)} etiquetas automáticas distintas (meta ≥ 4)"
+                )
+        if original_labels:
+            print("\n🌟 Etiquetas originales:")
+            for label, count in original_labels.items():
+                print(f"   • {label}: {count}")
+            if len(original_labels) < 4:
+                print(
+                    f"\n⚠️ Sólo se detectaron {len(original_labels)} etiquetas originales distintas (meta ≥ 4)"
+                )
+            low_originals = {label: count for label, count in original_labels.items() if count < 30}
+            missing_originals = [
+                label for label in ORIGINAL_SUFFIXES.values() if label not in original_labels
+            ]
+            if low_originals or missing_originals:
+                print("\n⚠️ Etiquetas originales con pocos ejemplos:")
+                for label, count in low_originals.items():
+                    print(f"   • {label}: {count} (<30)")
+                for label in missing_originals:
+                    print(f"   • {label}: 0 (<30)")
 
     if results['alerts']:
         print("\n⚠️ Alertas:")
@@ -995,6 +1111,9 @@ def apply_region_postprocessing(region: Dict, file_info: Dict, image_path: Path)
     region.update(features)
     quality_scores = comprehensive_quality_assessment(region, image_path, file_info)
     region.update(quality_scores)
+    region.setdefault('label_auto', region.get('label', 'unknown'))
+    region.setdefault('label_original', '')
+    region['label'] = region.get('label_auto', region.get('label', 'unknown'))
     region['file_name'] = image_path.name
     region['file_path'] = str(image_path)
     region.pop('context_factors', None)
@@ -1082,9 +1201,35 @@ def main() -> None:
     df_deduped = deduplicate_regions(df_quality, config)
     print(f"🧹 Eliminación de duplicados: {len(df_quality)} → {len(df_deduped)}")
 
+    geom_removed_pct = (
+        (len(df_initial) - len(df_geometric)) / len(df_initial) * 100 if len(df_initial) else 0.0
+    )
+    quality_removed_pct = (
+        (len(df_geometric) - len(df_quality)) / len(df_geometric) * 100 if len(df_geometric) else 0.0
+    )
+    filter_stats = {
+        'geom_removed_pct': geom_removed_pct,
+        'quality_removed_pct': quality_removed_pct,
+    }
+
     print("\n⚖️ APLICANDO BALANCEO INTELIGENTE")
     df_balanced = intelligent_balancing(df_deduped, config)
     print(f"📊 Dataset balanceado: {len(df_deduped)} → {len(df_balanced)}")
+
+    auto_counts: Dict[str, int] = {}
+    original_counts: Dict[str, int] = {}
+    if not df_balanced.empty:
+        if 'label_auto' in df_balanced.columns:
+            auto_counts = {
+                label: int(count) for label, count in df_balanced['label_auto'].value_counts().items()
+            }
+        if 'label_original' in df_balanced.columns:
+            original_series = df_balanced['label_original'].astype(str)
+            original_series = original_series[original_series.str.len() > 0]
+            original_counts = {
+                label: int(count) for label, count in original_series.value_counts().items()
+            }
+    label_summary = {'auto': auto_counts, 'original': original_counts}
 
     print("\n📋 VALIDACIÓN FINAL DE CALIDAD")
     validation_results = enhanced_quality_validation(df_balanced, config)
@@ -1092,9 +1237,14 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("📊 REPORTE FINAL DE CALIDAD")
     print("=" * 70)
-    generate_comprehensive_report(validation_results, df_balanced)
+    generate_comprehensive_report(validation_results, df_balanced, filter_stats, label_summary)
 
-    if validation_results['meets_standards']:
+    can_save = (
+        validation_results['meets_standards']
+        and validation_results['average_global_score'] >= QUALITY_THRESHOLDS['score_global_min']
+    )
+
+    if can_save:
         train_df, test_df = train_test_split(
             df_balanced,
             test_size=0.2,
@@ -1106,6 +1256,39 @@ def main() -> None:
         train_df['split'] = 'train'
         test_df['split'] = 'test'
         df_final = pd.concat([train_df, test_df], ignore_index=True)
+
+        if 'file_name' not in df_final.columns and 'file_path' in df_final.columns:
+            df_final['file_name'] = df_final['file_path'].apply(lambda p: Path(p).name)
+        if 'label_auto' not in df_final.columns:
+            df_final['label_auto'] = df_final.get('label', 'unknown')
+        df_final['label_auto'] = df_final['label_auto'].fillna(df_final.get('label', 'unknown'))
+        if 'label_original' not in df_final.columns:
+            df_final['label_original'] = ''
+        df_final['label_original'] = df_final['label_original'].fillna('')
+        if 'is_heuristic' not in df_final.columns:
+            df_final['is_heuristic'] = False
+        if 'big_mob_special' not in df_final.columns:
+            df_final['big_mob_special'] = False
+
+        required_columns = [
+            'file_name',
+            'label_original',
+            'label_auto',
+            'x',
+            'y',
+            'width',
+            'height',
+            'score_global',
+            'detection_confidence',
+            'is_heuristic',
+            'big_mob_special',
+            'split',
+        ]
+        for column in required_columns:
+            if column not in df_final.columns:
+                df_final[column] = '' if column in {'label_original', 'label_auto', 'file_name', 'split'} else 0
+        remaining_columns = [col for col in df_final.columns if col not in required_columns]
+        df_final = df_final[required_columns + remaining_columns]
         df_final.to_csv('data.csv', index=False)
 
         print("\n💾 DATASET GUARDADO EXITOSAMENTE")
@@ -1120,9 +1303,16 @@ def main() -> None:
         print("✅ PROCESO COMPLETADO EXITOSAMENTE")
     else:
         print("\n❌ EL DATASET NO CUMPLE LOS ESTÁNDARES DE CALIDAD")
-        print("   Alertas identificadas:")
-        for alert in validation_results['alerts']:
-            print(f"   • {alert}")
+        if validation_results['average_global_score'] < QUALITY_THRESHOLDS['score_global_min']:
+            print(
+                f"   • Score global promedio insuficiente ({validation_results['average_global_score']:.3f} < {QUALITY_THRESHOLDS['score_global_min']:.2f})"
+            )
+        if validation_results['alerts']:
+            print("   Alertas identificadas:")
+            for alert in validation_results['alerts']:
+                print(f"   • {alert}")
+        else:
+            print("   • No se alcanzaron los criterios necesarios para guardar el dataset.")
         if validation_results['recommendations']:
             print("\n   💡 Recomendaciones:")
             for recommendation in validation_results['recommendations']:
